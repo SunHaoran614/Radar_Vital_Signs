@@ -1,5 +1,7 @@
 # 快速参考卡片
 
+**所属项目**: 面向跨域场景的毫米波雷达生命体征检测关键技术研究
+
 ## 📋 项目结构速查
 
 ```
@@ -284,11 +286,12 @@ data.reshape(num_rx, num_adc, -1)
 
 ## 📞 获取帮助
 
+- 查看 [CROSS_DOMAIN_RESEARCH_PLAN.md](CROSS_DOMAIN_RESEARCH_PLAN.md) 了解研究方案
 - 查看 [DEVELOPMENT_GUIDE.md](DEVELOPMENT_GUIDE.md) 了解详细规范
-- 查看 [CODE_EXAMPLES.md](CODE_EXAMPLES.md) 了解代码示例
 - 查看 [DATASETS.md](DATASETS.md) 了解数据集详情
 
 ---
 
+**项目名称**: 面向跨域场景的毫米波雷达生命体征检测关键技术研究
 **保持代码整洁，保持逻辑清晰！** 🚀
 

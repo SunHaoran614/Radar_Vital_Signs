@@ -1,8 +1,10 @@
 # 代码开发守则
 
+**所属项目**: 面向跨域场景的毫米波雷达生命体征检测关键技术研究
+
 ## 文档概述
 
-本文档定义了雷达生命体征检测研究项目的代码开发规范、项目架构和最佳实践，确保代码质量、可维护性和研究可重复性。
+本文档定义了"面向跨域场景的毫米波雷达生命体征检测关键技术研究"项目的代码开发规范、项目架构和最佳实践，确保代码质量、可维护性和研究可重复性。
 
 ---
 
@@ -105,9 +107,10 @@ Radar_Vital_Signs/
 │   └── figures/                      # 图表
 │
 ├── docs/                             # 文档
-│   ├── README.md                     # 项目说明
+│   ├── CROSS_DOMAIN_RESEARCH_PLAN.md # 跨域研究完整方案
 │   ├── DATASETS.md                   # 数据集文档
-│   └── DEVELOPMENT_GUIDE.md          # 开发守则（本文件）
+│   ├── DEVELOPMENT_GUIDE.md          # 开发守则（本文件）
+│   └── QUICK_REFERENCE.md            # 快速参考
 │
 ├── .gitignore                        # Git忽略文件
 ├── requirements.txt                  # Python依赖
@@ -974,6 +977,18 @@ git commit -m "perf(fft): 优化Range FFT性能"
 
 ### 9.2 GitHub工作流程
 
+#### 常用指令
+```bash
+# 本地存储的远程分支缓存
+git branch -r
+
+# 远程仓库中实时的分支状态
+git ls-remote --heads origin
+
+# 清理过时的远程分支缓存
+git fetch origin --prune
+```
+
 #### 初次上传到GitHub
 
 **步骤1: 创建GitHub仓库**
@@ -981,7 +996,7 @@ git commit -m "perf(fft): 优化Range FFT性能"
 2. 点击右上角 "+" → "New repository"
 3. 填写仓库信息：
    - Repository name: `Radar_Vital_Signs`
-   - Description: "雷达生命体征检测研究项目"
+   - Description: "面向跨域场景的毫米波雷达生命体征检测关键技术研究"
    - 选择 Public 或 Private
    - **不要**勾选 "Initialize with README"（本地已有）
 4. 点击 "Create repository"
@@ -1342,7 +1357,8 @@ sphinx-build -b html docs/ docs/_build/
 
 ---
 
-**文档版本**: 1.0  
-**最后更新**: 2025-11-07  
+**项目名称**: 面向跨域场景的毫米波雷达生命体征检测关键技术研究
+**文档版本**: 1.1
+**最后更新**: 2025-11-11
 **维护者**: 项目团队
 
