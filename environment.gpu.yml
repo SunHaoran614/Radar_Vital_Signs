@@ -1,0 +1,12 @@
+name: radar-gpu
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pytorch
+  - pytorch-cuda=12.4
+  - torchvision
+  - torchaudio
+  - pip
