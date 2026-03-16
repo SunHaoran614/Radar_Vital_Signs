@@ -9,3 +9,5 @@ dependencies:
   - matplotlib
   - pyyaml
   - tqdm
+  - ruff
+  - pytest
