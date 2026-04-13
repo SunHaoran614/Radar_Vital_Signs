@@ -31,6 +31,8 @@ COPY docker_assets/wheels /tmp/wheels
 RUN pip install --no-cache-dir /tmp/wheels/* \
     && rm -rf /tmp/wheels
 
+RUN pip install --no-cache-dir numpy==2.1.3 pandas==2.2.3
+
 WORKDIR /workspace
 
 CMD python -c "import torch, numpy, scipy, matplotlib; \

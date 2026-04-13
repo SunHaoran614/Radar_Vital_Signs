@@ -21,6 +21,18 @@
 
 数据结构细节见 [docs/DATASETS.md](docs/DATASETS.md)。
 
+### 2.1 近期统一导出更新（2026-04-11）
+
+- 更新文件：`src/data/loaders/export_all_datasets.py`
+- 统一目标：
+  - 三数据集导出统一字段：`radar`, `time`, `heart_rate`, `respiration_rate`。
+  - 统一雷达特征域：将 FTU/BGT60 从 `(frames, rx, chirps, samples)` 转换到 PhysDrive 风格 `(frames, doppler, angle, range)`，默认对齐为 `8x16x8`。
+  - PhysDrive 标签对齐：从 `ecg/respiration` 估计 `heart_rate/respiration_rate`，并补齐 `time`（当前按 `20 Hz` 对齐）。
+  - FTU/BGT60 的 `range` 维选择已更新：由“逐帧 top-k”改为“全样本能量中心 + 连续窗口”，提升跨帧语义稳定性。
+- 说明：
+  - PhysDrive 在当前公开包中是 processed mmWave，不是原始 ADC；FTU/BGT60 为原始或近原始数据，因此统一前必须走特征变换。
+  - 详细背景与参数来源已同步到 `docs/DATASETS.md`。
+
 ## 3. 未来整体项目规划（按实验包执行）
 
 ### 包A：数据统一与质量分析
@@ -152,7 +164,20 @@
 - 若要提升论文创新性，建议升级到：`基线DA + Source-Free/TTA + 雷达物理先验前端`。
 
 
-## 7. docker
+## 7. 文档边界
+
+- 保留：`docs/DATASETS.md`
+- 规划、实验矩阵、指标定义统一维护在本文件
+
+## 8. 文档同步约定
+
+- 凡是涉及加载器输出字段、雷达轴语义、采样率/时间轴、导出格式的代码变更，需同步更新：
+  - `docs/DATASETS.md`（数据事实与接口语义）
+  - `README.md`（方案级摘要与影响范围）
+- 提交前至少检查一次“代码实现 vs 文档描述”一致性，避免后续实验配置偏差。
+
+
+## 9. docker
 ```bash
 docker run -it --gpus all \
   --network host \

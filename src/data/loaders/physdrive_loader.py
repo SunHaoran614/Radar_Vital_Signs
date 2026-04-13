@@ -90,7 +90,8 @@ class PhysDriveDataLoader(BaseDataLoader):
         self,
         session_id: str,
         sample_id: int,
-        return_complex: bool = True
+        return_complex: bool = True,
+        normalize_frames: bool = True,
     ) -> np.ndarray:
         """加载雷达数据。
         
@@ -98,6 +99,7 @@ class PhysDriveDataLoader(BaseDataLoader):
             session_id: 会话ID (如 'AFH1')
             sample_id: 样本ID (如 0 对应 AFH1_00)
             return_complex: 是否返回复数格式，默认True
+            normalize_frames: 是否将帧数标准化到600（短样本补零、长样本截断），默认True
         
         Returns:
             雷达数据立方体:
@@ -128,12 +130,22 @@ class PhysDriveDataLoader(BaseDataLoader):
         mmwave = mat_data['mmwave']
         
         # 验证数据形状
-        expected_shape = (self.NUM_FRAMES, 2, self.NUM_DOPPLER, 
-                         self.NUM_ANGLE, self.NUM_RANGE)
-        if mmwave.shape != expected_shape:
+        expected_tail = (2, self.NUM_DOPPLER, self.NUM_ANGLE, self.NUM_RANGE)
+        if mmwave.ndim != 5 or mmwave.shape[1:] != expected_tail:
+            expected_shape = (self.NUM_FRAMES,) + expected_tail
             raise ValueError(
                 f"数据形状不匹配。期望: {expected_shape}, 实际: {mmwave.shape}"
             )
+
+        # 仅帧数不一致时，可选择标准化到固定帧长
+        if mmwave.shape[0] != self.NUM_FRAMES:
+            if normalize_frames:
+                mmwave = self._normalize_mmwave_frames(mmwave, target_frames=self.NUM_FRAMES)
+            else:
+                expected_shape = (self.NUM_FRAMES,) + expected_tail
+                raise ValueError(
+                    f"数据形状不匹配。期望: {expected_shape}, 实际: {mmwave.shape}"
+                )
         
         # 转换为复数格式
         if return_complex:
@@ -401,21 +413,43 @@ class PhysDriveDataLoader(BaseDataLoader):
         Raises:
             FileNotFoundError: 如果文件不存在
         """
-        # 构建样本目录名，如 'AFH1_00'
-        sample_dir_name = f"{session_id}_{sample_id:02d}"
+        session_dir = self.mmwave_path / session_id
+        if not session_dir.exists():
+            raise FileNotFoundError(f"会话目录不存在: {session_dir}")
 
-        # 完整路径
-        file_path = (
-            self.mmwave_path /
-            session_id /
-            sample_dir_name /
-            filename
-        )
+        # 优先尝试常见两位格式
+        candidates = [session_dir / f"{session_id}_{sample_id:02d}" / filename]
+        # 兼容三位及以上前导零目录（如 AFZ2_010）
+        for d in session_dir.iterdir():
+            if not d.is_dir() or not d.name.startswith(session_id + "_"):
+                continue
+            suffix = d.name.split("_", 1)[1]
+            if suffix.isdigit() and int(suffix) == sample_id:
+                candidates.append(d / filename)
 
-        if not file_path.exists():
-            raise FileNotFoundError(f"文件不存在: {file_path}")
+        for p in candidates:
+            if p.exists():
+                return p
 
-        return file_path
+        # 保留最可读的默认路径用于报错
+        raise FileNotFoundError(f"文件不存在: {candidates[0]}")
+
+    def _normalize_mmwave_frames(
+        self,
+        mmwave: np.ndarray,
+        target_frames: int,
+    ) -> np.ndarray:
+        """将 mmwave 的帧数标准化到 target_frames。"""
+        cur = int(mmwave.shape[0])
+        if cur == target_frames:
+            return mmwave
+        if cur > target_frames:
+            return mmwave[:target_frames]
+
+        # 帧数不足时尾部补零，保持数据语义最小侵入
+        pad_shape = (target_frames - cur,) + tuple(mmwave.shape[1:])
+        pad = np.zeros(pad_shape, dtype=mmwave.dtype)
+        return np.concatenate([mmwave, pad], axis=0)
 
     def _convert_to_complex(self, mmwave: np.ndarray) -> np.ndarray:
         """将实部/虚部分离的数据转换为复数格式。
@@ -473,4 +507,3 @@ class PhysDriveDataLoader(BaseDataLoader):
                 'data_format': 'Processed RDA (Range-Doppler-Angle)'
             }
         }
-
