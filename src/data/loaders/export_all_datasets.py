@@ -27,6 +27,10 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 
+from src.data.loaders.bgt60_loader import BGT60TR13CDataLoader
+from src.data.loaders.ftu_loader import FTUDataLoader
+from src.data.loaders.physdrive_loader import PhysDriveDataLoader
+
 try:
     import neurokit2 as nk  # type: ignore[import-not-found]
 except ImportError:
@@ -36,10 +40,6 @@ except ImportError:
 ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-
-from src.data.loaders.bgt60_loader import BGT60TR13CDataLoader
-from src.data.loaders.ftu_loader import FTUDataLoader
-from src.data.loaders.physdrive_loader import PhysDriveDataLoader
 
 # ==================== Global Config (Manual Edit) ====================
 # 数据路径与输出路径
