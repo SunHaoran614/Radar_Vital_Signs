@@ -1,7 +1,7 @@
 """BGT60TR13C数据集加载器"""
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 import numpy as np
 import pandas as pd
 import json
