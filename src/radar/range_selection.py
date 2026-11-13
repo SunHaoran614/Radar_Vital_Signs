@@ -18,6 +18,8 @@ from typing import Any, Dict, Tuple
 import numpy as np
 
 from .pipeline import register_stage, DEFAULT_FS
+from .hr_phase_score import hr_phase_power
+from .numerics import magnitude_squared
 
 
 def _complex_safe(x: np.ndarray) -> np.ndarray:
@@ -25,29 +27,17 @@ def _complex_safe(x: np.ndarray) -> np.ndarray:
 
 
 def _range_profile(cube: np.ndarray, mode: str = "energy",
-                   fs: float = DEFAULT_FS) -> np.ndarray:
+                   fs: float = DEFAULT_FS,
+                   hr_band: tuple[float, float] = (0.75, 3.5)) -> np.ndarray:
     """Scalar per-range score collapsed over (F, D, A)."""
-    mag2 = np.mean(np.abs(cube) ** 2, axis=(0, 1, 2))  # (R,)
+    mag2 = np.mean(magnitude_squared(cube), axis=(0, 1, 2))  # (R,)
     if mode == "energy":
         return mag2
     if mode == "hr_band":
         f = cube.shape[0]
         if f < 8:
             return mag2
-        freqs = np.fft.rfftfreq(f, d=1.0 / float(fs))
-        band = (freqs >= 0.75) & (freqs <= 2.5)
-        i = cube.real.reshape(f, -1)
-        q = cube.imag.reshape(f, -1)
-        di = np.diff(i, axis=0)
-        dq = np.diff(q, axis=0)
-        denom = i[:-1] ** 2 + q[:-1] ** 2 + 1e-6
-        dphi = (i[:-1] * dq - q[:-1] * di) / denom
-        phase = np.cumsum(dphi, axis=0)  # (f-1, cells)
-        phase_padded = np.zeros((f, phase.shape[1]), dtype=phase.dtype)
-        phase_padded[: phase.shape[0]] = phase
-        spec = np.abs(np.fft.rfft(phase_padded, axis=0)) ** 2  # (f//2+1, cells)
-        per_cell = spec[band].sum(axis=0)  # (cells,)
-        return per_cell.reshape(cube.shape[1:]).mean(axis=(0, 1))  # (R,)
+        return hr_phase_power(cube, fs, hr_band).mean(axis=(0, 1))
     return mag2
 
 
@@ -87,7 +77,7 @@ def range_weighted_center(cube: np.ndarray, half_width: int = 4, **_: Any) -> np
     cube = _complex_safe(cube)
     r = cube.shape[3]
     profile = _range_profile(cube, mode="energy")
-    if profile.sum() <= 1e-12:
+    if profile.sum() <= 0:
         return cube
     center = int(round(float(np.sum(np.arange(r) * profile) / profile.sum())))
     lo = max(0, center - half_width)
@@ -96,7 +86,9 @@ def range_weighted_center(cube: np.ndarray, half_width: int = 4, **_: Any) -> np
 
 
 def range_hr_band(cube: np.ndarray, half_width: int = 2,
-                  fs: float = DEFAULT_FS, **_: Any) -> np.ndarray:
+                  fs: float = DEFAULT_FS,
+                  hr_band: tuple[float, float] = (0.75, 3.5),
+                  **_: Any) -> np.ndarray:
     """R3: HR-band-weighted range center -- keep the range most likely to hold the heartbeat.
 
     This directly attacks the "total energy max != heartbeat max" issue: car
@@ -106,13 +98,37 @@ def range_hr_band(cube: np.ndarray, half_width: int = 2,
     """
     cube = _complex_safe(cube)
     r = cube.shape[3]
-    profile = _range_profile(cube, mode="hr_band", fs=fs)
-    if profile.sum() <= 1e-12:
+    profile = _range_profile(cube, mode="hr_band", fs=fs, hr_band=hr_band)
+    if profile.sum() <= 0:
         # fall back to energy weighting if no HR-band evidence
         profile = _range_profile(cube, mode="energy", fs=fs)
-    center = int(round(float(np.sum(np.arange(r) * profile) / (profile.sum() + 1e-12))))
+    total = profile.sum()
+    if total <= 0:
+        return cube
+    center = int(round(float(np.sum(np.arange(r) * profile) / total)))
     lo = max(0, center - half_width)
     hi = min(r, center + half_width + 1)
+    return _mask_range(cube, np.arange(lo, hi))
+
+
+def range_hr_band_coherence(cube: np.ndarray, half_width: int = 2,
+                            top_k: int = 8, fs: float = DEFAULT_FS,
+                            hr_band: tuple[float, float] = (0.75, 3.5),
+                            **_: Any) -> np.ndarray:
+    """HR-band range candidate penalised by cross-spatial IQ incoherence.
+
+    HR-band power alone can select an isolated noisy antenna/range cell.  Keep
+    only the top ``top_k`` HR-power ranges, then score each by
+    ``log1p(power / median_power) * unit-circle coherence`` over the spatial
+    (D,A) axes.  This is radar-only and preserves the cube shape contract.
+    """
+    from .hr_coherence_selection import select_hr_coherence_range
+
+    cube = _complex_safe(cube)
+    r = cube.shape[3]
+    center = select_hr_coherence_range(cube, fs, hr_band, top_k)
+    lo = max(0, int(center) - half_width)
+    hi = min(r, int(center) + half_width + 1)
     return _mask_range(cube, np.arange(lo, hi))
 
 
@@ -121,3 +137,4 @@ def register_range_selection_methods() -> None:
     register_stage("range_selection", "peak", range_peak)
     register_stage("range_selection", "weighted_center", range_weighted_center)
     register_stage("range_selection", "hr_band", range_hr_band)
+    register_stage("range_selection", "hr_band_coherence", range_hr_band_coherence)

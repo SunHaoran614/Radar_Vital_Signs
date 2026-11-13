@@ -21,6 +21,7 @@ DEFAULT_VMD_TOL = 1e-5
 DEFAULT_SAMPLING_RATE_HZ = 20.0
 DEFAULT_HR_BAND_HZ = (0.75, 2.5)
 DEFAULT_RESP_BAND_HZ = (0.1, 0.6)
+DECOMPOSITION_ALGORITHM_VERSION = "positive_rfft_gauss_seidel_amplitude_v2"
 
 def vmd_decompose(
     signal: np.ndarray,
@@ -30,64 +31,75 @@ def vmd_decompose(
     tol: float = DEFAULT_VMD_TOL,
     init_omega: Optional[np.ndarray] = None,
 ) -> np.ndarray:
-    """Variational mode decomposition for one real-valued fixed-length signal."""
+    """Stable positive-frequency VMD update for one real-valued signal.
+
+    Updates use the current sum of modes (Gauss-Seidel). A real FFT keeps only
+    independent positive frequencies; inverse rFFT restores conjugate symmetry.
+    Mode amplitudes are retained, since per-mode z-scoring destroys the
+    decomposition's reconstruction semantics.
+    """
     x = zscore_1d(signal)
     n = int(x.size)
     if n == 0:
         return np.empty((k, 0), dtype=np.float32)
-    if not np.isfinite(x).any():
+    if np.std(x) < 1e-8:
         return np.zeros((k, n), dtype=np.float32)
 
-    freqs = np.fft.fftfreq(n).astype(np.float32)
-    spectrum = np.fft.fft(x).astype(np.complex64)
-    positive = freqs >= 0
+    freqs = np.fft.rfftfreq(n).astype(np.float64)
+    spectrum = np.fft.rfft(x).astype(np.complex128)
 
-    u_hat = np.zeros((k, n), dtype=np.complex64)
+    u_hat = np.zeros((k, freqs.size), dtype=np.complex128)
     if init_omega is None:
-        omega = np.linspace(0.0, 0.5, k + 2, dtype=np.float32)[1:-1]
+        omega = np.linspace(0.0, 0.5, k + 2, dtype=np.float64)[1:-1]
     else:
-        omega = np.asarray(init_omega, dtype=np.float32).reshape(-1)
+        omega = np.asarray(init_omega, dtype=np.float64).reshape(-1)
         if omega.size != k:
             raise ValueError(f"init_omega must contain {k} value(s)")
-        omega = np.clip(omega, 0.0, 0.5).astype(np.float32)
-    lambda_hat = np.zeros(n, dtype=np.complex64)
-    tau = 0.0
+        omega = np.clip(omega, 0.0, 0.5).astype(np.float64)
 
     for _ in range(max_iter):
         previous = u_hat.copy()
         sum_modes = np.sum(u_hat, axis=0)
         for mode_idx in range(k):
-            residual = spectrum - (sum_modes - u_hat[mode_idx]) - lambda_hat / 2.0
+            residual = spectrum - (sum_modes - u_hat[mode_idx])
             denom = 1.0 + alpha * (freqs - omega[mode_idx]) ** 2
             update = residual / denom
-            update = np.nan_to_num(update, nan=0.0, posinf=0.0, neginf=0.0)
-            update = np.clip(update.real, -1e6, 1e6) + 1j * np.clip(update.imag, -1e6, 1e6)
-            u_hat[mode_idx] = update.astype(np.complex64)
-            power = np.abs(u_hat[mode_idx, positive]) ** 2
+            if not np.all(np.isfinite(update)):
+                raise FloatingPointError("Nonfinite VMD mode update")
+            sum_modes += update - u_hat[mode_idx]
+            u_hat[mode_idx] = update
+            power = np.abs(update) ** 2
             power_sum = float(np.sum(power))
             if np.isfinite(power_sum) and power_sum > 1e-12:
-                new_omega = float(np.sum(freqs[positive] * power) / power_sum)
+                new_omega = float(np.sum(freqs * power) / power_sum)
                 if np.isfinite(new_omega):
                     omega[mode_idx] = float(np.clip(new_omega, 0.0, 0.5))
-        lambda_hat = lambda_hat + tau * (np.sum(u_hat, axis=0) - spectrum)
         diff = np.linalg.norm(u_hat - previous) / (np.linalg.norm(previous) + 1e-12)
         if not np.isfinite(diff):
-            u_hat = previous
-            break
+            raise FloatingPointError("Nonfinite VMD convergence metric")
         if diff < tol:
             break
 
-    modes = np.real(np.fft.ifft(u_hat, axis=1)).astype(np.float32)
-    modes[~np.isfinite(modes)] = 0.0
-    return np.stack([zscore_1d(mode) for mode in modes], axis=0).astype(np.float32)
+    modes = np.fft.irfft(u_hat, n=n, axis=1).astype(np.float32)
+    if not np.all(np.isfinite(modes)):
+        raise FloatingPointError("Nonfinite VMD output")
+    return modes
 
 
 def hr_adavmd_initial_omega(
     k: int,
     sampling_rate_hz: float = DEFAULT_SAMPLING_RATE_HZ,
+    init_profile: str = "legacy",
 ) -> np.ndarray:
     """Physiology-guided VMD center-frequency initialization."""
-    base_hz = np.asarray([0.2, 0.45, 0.8, 1.1, 1.45, 1.9, 2.4, 3.2, 4.2], dtype=np.float32)
+    if init_profile == "expanded_3p5":
+        # Explicit experimental arm; merely covering 3.2 Hz does not prove
+        # better decomposition on real FTU recordings.
+        base_hz = np.asarray([0.2, 0.45, 0.8, 1.2, 1.8, 2.5, 3.2, 4.2, 5.0], dtype=np.float32)
+    elif init_profile == "legacy":
+        base_hz = np.asarray([0.2, 0.45, 0.8, 1.1, 1.45, 1.9, 2.4, 3.2, 4.2], dtype=np.float32)
+    else:
+        raise ValueError(f"Unknown VMD initialization profile: {init_profile}")
     if k <= base_hz.size:
         centers_hz = base_hz[:k]
     else:
@@ -175,9 +187,12 @@ def hr_adavmd_decompose(
     max_iter: int = DEFAULT_VMD_MAX_ITER,
     tol: float = DEFAULT_VMD_TOL,
     sampling_rate_hz: float = DEFAULT_SAMPLING_RATE_HZ,
+    hr_band_hz: Tuple[float, float] = DEFAULT_HR_BAND_HZ,
+    init_profile: str = "legacy",
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
     """Heart-rate-aware adaptive VMD for radar micro-motion signals."""
-    init_omega = hr_adavmd_initial_omega(k=k, sampling_rate_hz=sampling_rate_hz)
+    init_omega = hr_adavmd_initial_omega(
+        k=k, sampling_rate_hz=sampling_rate_hz, init_profile=init_profile)
     modes = vmd_decompose(
         signal=signal,
         k=k,
@@ -189,10 +204,13 @@ def hr_adavmd_decompose(
     weights, scores, score_meta = hr_adavmd_mode_scores(
         modes,
         sampling_rate_hz=sampling_rate_hz,
+        hr_band_hz=hr_band_hz,
     )
     weighted_modes = (modes * weights[:, None]).astype(np.float32)
     meta = {
         "decomposition_method": "HR-AdaVMD",
+        "decomposition_algorithm_version": DECOMPOSITION_ALGORITHM_VERSION,
+        "vmd_init_profile": init_profile,
         "hr_adavmd_components": [
             "physiology_guided_frequency_initialization",
             "heart_band_mode_scoring",
@@ -204,5 +222,3 @@ def hr_adavmd_decompose(
         "selected_mode_count": int(k),
     }
     return weighted_modes, meta
-
-

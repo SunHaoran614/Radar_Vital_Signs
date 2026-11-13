@@ -1,6 +1,0 @@
-stage,tag,method,downstream,mae_bpm,r2,pearson_r,delta_mae,status,status_reason,nan_inf,var,abs_mean,std,discontinuity,hr_band_power,spectral_flatness,temporal_cont
-baseline_cube,-,identity,spec_mean,12.5035,0.15049,0.38796,0.0,BASELINE,,0.0,0.33213,0.3921,0.5171,0.34586,0.33214,0.77414,0.62466
-baseline_phase,P,single_bin_trace,phase_trace,12.22878,0.17568,0.4195,0.0,BASELINE,,0.0,0.29831,0.3696,0.48775,0.32349,0.29831,0.77244,0.62903
-range_selection,R,hr_band,spec_mean,12.34711,0.16454,0.40566,-0.1564,HOLD,|delta|=0.16<0.50,0.0,0.33213,0.3921,0.5171,0.34586,0.33214,0.77414,0.62466
-range_selection,R,peak,spec_mean,12.55304,0.1408,0.37539,0.04954,HOLD,|delta|=0.05<0.50,0.0,0.33213,0.3921,0.5171,0.34586,0.33214,0.77414,0.62466
-range_selection,R,weighted_center,spec_mean,12.5035,0.15049,0.38796,0.0,HOLD,|delta|=0.00<0.50,0.0,0.33213,0.3921,0.5171,0.34586,0.33214,0.77414,0.62466

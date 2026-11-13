@@ -20,19 +20,21 @@ if str(ROOT) not in sys.path:
 
 from src.models.factory import MODEL_CHOICES, count_parameters, create_model
 from src.training.common.checkpoints import load_run_config, resolve_checkpoint
-from src.training.common.metrics import aggregate, append_prediction_rows
-from src.training.datasets import LabelStats, RadarWindowDataset
+from src.training.common.protocol import require_single_source_dataset, require_transfer_feature_contract
+from src.training.datasets import LabelStats, RadarUnlabeledWindowDataset
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Pseudo-label temporal adaptation on unlabeled target-domain data.")
     parser.add_argument("--source-model-dir", type=Path, required=True)
+    parser.add_argument("--expected-source-dataset", choices=["FTU", "BGT60TR13C", "PhysDrive", "Nature"],
+                        default="FTU", help="Assert the checkpoint used only this labeled source (default: FTU).")
     parser.add_argument("--checkpoint", type=Path, default=None, help="Defaults to <source-model-dir>/best.pt.")
     parser.add_argument("--model", choices=MODEL_CHOICES, default=None)
     parser.add_argument("--export-dir", type=Path, default=Path("training_exports"))
-    parser.add_argument("--target-datasets", nargs="+", required=True, choices=["FTU", "BGT60TR13C", "PhysDrive"])
-    parser.add_argument("--adapt-split", choices=["train", "val", "test"], default="train")
-    parser.add_argument("--eval-split", choices=["train", "val", "test"], default="test")
+    parser.add_argument("--target-datasets", nargs="+", required=True,
+                        choices=["FTU", "BGT60TR13C", "PhysDrive", "Nature"])
+    parser.add_argument("--adapt-split", choices=["train"], default="train")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=64)
@@ -60,7 +62,7 @@ def moving_average(values: np.ndarray, window: int) -> np.ndarray:
 
 def generate_temporal_pseudo_labels(
     model: nn.Module,
-    dataset: RadarWindowDataset,
+    dataset: RadarUnlabeledWindowDataset,
     loader: DataLoader,
     stats: LabelStats,
     device: torch.device,
@@ -68,6 +70,8 @@ def generate_temporal_pseudo_labels(
     confidence_temperature: float,
     min_weight: float,
 ) -> tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+    if temporal_window < 1 or temporal_window % 2 != 1:
+        raise ValueError("temporal_window must be a positive odd number")
     model.eval()
     pred_by_index: Dict[int, float] = {}
     with torch.inference_mode():
@@ -78,17 +82,28 @@ def generate_temporal_pseudo_labels(
             pred_norm = model(x_time, x_freq).detach().cpu()
             pred_bpm = stats.denormalize(pred_norm).numpy().astype(np.float32)
             for row_index, pred in zip(row_indices, pred_bpm):
+                if int(row_index) in pred_by_index:
+                    raise ValueError(f"Duplicate adaptation row index: {row_index}")
                 pred_by_index[int(row_index)] = float(pred)
+
+    if set(pred_by_index) != set(range(len(dataset))):
+        raise ValueError("Pseudo-label inference did not cover every target window exactly once")
 
     pseudo_bpm = np.zeros(len(dataset), dtype=np.float32)
     weights = np.ones(len(dataset), dtype=np.float32)
-    groups: Dict[str, list[int]] = {}
+    groups: Dict[tuple[str, str, str], list[int]] = {}
     for idx, row in enumerate(dataset.rows):
-        groups.setdefault(row.get("group_key", ""), []).append(idx)
+        key = (row.get("dataset", ""), row.get("group_key", ""), row.get("sample_tag", ""))
+        if not all(key):
+            raise ValueError(f"Target window lacks record identity: {idx}")
+        groups.setdefault(key, []).append(idx)
 
-    group_summary: Dict[str, Any] = {}
-    for group_key, indices in groups.items():
+    record_summary: list[Dict[str, Any]] = []
+    for (dataset_name, group_key, sample_tag), indices in sorted(groups.items()):
         indices = sorted(indices, key=lambda idx: int(dataset.rows[idx].get("window_start") or 0))
+        starts = [int(dataset.rows[idx]["window_start"]) for idx in indices]
+        if len(starts) != len(set(starts)):
+            raise ValueError(f"Duplicate target window start: {dataset_name}/{sample_tag}")
         raw = np.asarray([pred_by_index[idx] for idx in indices], dtype=np.float32)
         corrected = moving_average(raw, temporal_window)
         residual = np.abs(raw - corrected)
@@ -97,13 +112,16 @@ def generate_temporal_pseudo_labels(
         for local_idx, row_idx in enumerate(indices):
             pseudo_bpm[row_idx] = corrected[local_idx]
             weights[row_idx] = confidence[local_idx]
-        group_summary[group_key] = {
+        record_summary.append({
+            "dataset": dataset_name,
+            "group_key": group_key,
+            "sample_tag": sample_tag,
             "count": len(indices),
             "raw_pred_mean_bpm": float(np.mean(raw)),
             "pseudo_mean_bpm": float(np.mean(corrected)),
             "mean_weight": float(np.mean(confidence)),
             "mean_temporal_residual_bpm": float(np.mean(residual)),
-        }
+        })
 
     pseudo_norm = ((pseudo_bpm - float(stats.mean)) / float(stats.std)).astype(np.float32)
     summary = {
@@ -112,13 +130,15 @@ def generate_temporal_pseudo_labels(
         "weight_mean": float(np.mean(weights)),
         "weight_min": float(np.min(weights)),
         "weight_max": float(np.max(weights)),
-        "by_group": group_summary,
+        "smoothing_unit": "dataset/group_key/sample_tag physical record",
+        "n_records": len(record_summary),
+        "by_record": record_summary,
     }
     return pseudo_norm, weights.astype(np.float32), summary
 
 
 class WeightedPseudoLabelDataset(Dataset):
-    def __init__(self, base: RadarWindowDataset, pseudo_norm: np.ndarray, weights: np.ndarray) -> None:
+    def __init__(self, base: RadarUnlabeledWindowDataset, pseudo_norm: np.ndarray, weights: np.ndarray) -> None:
         self.base = base
         self.pseudo_norm = pseudo_norm.astype(np.float32)
         self.weights = weights.astype(np.float32)
@@ -165,28 +185,6 @@ def weighted_adaptation_epoch(
     }
 
 
-def evaluate(model: nn.Module, loader: DataLoader, stats: LabelStats, device: torch.device) -> Dict[str, Any]:
-    model.eval()
-    rows: list[Dict[str, Any]] = []
-    criterion = nn.SmoothL1Loss(beta=0.5, reduction="sum")
-    total_loss = 0.0
-    seen = 0
-    with torch.inference_mode():
-        for batch in loader:
-            x_time = batch["x_time"].to(device, non_blocking=True)
-            x_freq = batch["x_freq"].to(device, non_blocking=True)
-            y = batch["y"].to(device, non_blocking=True)
-            pred = model(x_time, x_freq)
-            total_loss += float(criterion(pred, y))
-            seen += int(y.numel())
-            append_prediction_rows(rows, batch, pred, stats, include_participant=False)
-    result = aggregate(rows)["overall"]
-    result["loss"] = total_loss / seen if seen else math.nan
-    result["by_group"] = aggregate(rows, "group_key")
-    result["by_dataset"] = aggregate(rows, "dataset")
-    return result
-
-
 def main() -> None:
     args = parse_args()
     torch.manual_seed(args.seed)
@@ -194,6 +192,8 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     run_config = load_run_config(args.source_model_dir)
+    require_single_source_dataset(run_config, args.expected_source_dataset)
+    transfer_contract = require_transfer_feature_contract(run_config, args.export_dir)
     checkpoint_path = resolve_checkpoint(args.source_model_dir, args.checkpoint)
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     model_name = args.model or run_config.get("model")
@@ -207,8 +207,9 @@ def main() -> None:
     model = model.to(device)
 
     target_datasets = set(args.target_datasets)
-    adapt_ds = RadarWindowDataset(args.export_dir, args.adapt_split, label_stats=stats, datasets=target_datasets)
-    eval_ds = RadarWindowDataset(args.export_dir, args.eval_split, label_stats=stats, datasets=target_datasets)
+    if args.expected_source_dataset in target_datasets:
+        raise ValueError("Target adaptation datasets must exclude the labeled source dataset")
+    adapt_ds = RadarUnlabeledWindowDataset(args.export_dir, args.adapt_split, datasets=target_datasets)
     loader_kwargs = {
         "batch_size": args.batch_size,
         "num_workers": args.num_workers,
@@ -228,9 +229,6 @@ def main() -> None:
 
     pseudo_ds = WeightedPseudoLabelDataset(adapt_ds, pseudo_norm=pseudo_norm, weights=weights)
     pseudo_loader = DataLoader(pseudo_ds, shuffle=True, drop_last=False, **loader_kwargs)
-    eval_loader = DataLoader(eval_ds, shuffle=False, drop_last=False, **loader_kwargs)
-    before_eval = evaluate(model, eval_loader, stats, device)
-
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     history = []
     for epoch in range(1, args.epochs + 1):
@@ -242,7 +240,6 @@ def main() -> None:
             flush=True,
         )
 
-    after_eval = evaluate(model, eval_loader, stats, device)
     serializable_args = vars(args) | {
         "source_model_dir": str(args.source_model_dir),
         "checkpoint": str(checkpoint_path),
@@ -254,11 +251,11 @@ def main() -> None:
         "config": checkpoint["config"],
         "label_stats": checkpoint["label_stats"],
         "source_checkpoint": str(checkpoint_path),
+        "transfer_feature_contract": transfer_contract,
         "adaptation": {
             "method": "Pseudo-label Adaptation + Temporal Confidence Weighting",
             "target_datasets": sorted(target_datasets),
             "adapt_split": args.adapt_split,
-            "eval_split": args.eval_split,
             "pseudo_summary": pseudo_summary,
             "args": serializable_args,
         },
@@ -269,10 +266,11 @@ def main() -> None:
         "model": model_name,
         "parameters": count_parameters(model),
         "source_checkpoint": str(checkpoint_path),
+        "transfer_feature_contract": transfer_contract,
         "method": "Pseudo-label Adaptation + Temporal Confidence Weighting",
         "pseudo_summary": pseudo_summary,
-        "before_adaptation": before_eval,
-        "after_adaptation": after_eval,
+        "target_hr_labels_used": False,
+        "evaluation": "run evaluate_model.py separately after adaptation is frozen",
         "history": history,
     }
     run_config = {

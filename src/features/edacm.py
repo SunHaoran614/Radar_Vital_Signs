@@ -148,6 +148,7 @@ def spatial_consistency_scores(candidate_bins: np.ndarray, peak_bins: np.ndarray
 def select_target_bin_indices(
     radar: np.ndarray,
     top_bins: int,
+    hr_band_hz: Tuple[float, float] = DEFAULT_HR_BAND_HZ,
 ) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
     energy = np.mean(np.abs(radar) ** 2, axis=0)
     flat = energy.reshape(-1)
@@ -164,7 +165,7 @@ def select_target_bin_indices(
     for d_idx, a_idx, r_idx in candidate_multi:
         phase = edacm_phase(radar[:, int(d_idx), int(a_idx), int(r_idx)])
         phase_stability.append(phase_stability_score(phase))
-        hr_peak.append(hr_band_peak_score(phase))
+        hr_peak.append(hr_band_peak_score(phase, band_hz=hr_band_hz))
 
     peak_bins = segment_peak_bins(radar)
     energy_scores = minmax_score(np.log1p(flat[candidate_flat]))
@@ -196,7 +197,7 @@ def select_target_bin_indices(
             "hr_band_peak": 0.25,
             "spatial_consistency": 0.15,
         },
-        "hr_band_hz": [float(DEFAULT_HR_BAND_HZ[0]), float(DEFAULT_HR_BAND_HZ[1])],
+        "hr_band_hz": [float(hr_band_hz[0]), float(hr_band_hz[1])],
         "spatial_stability_segments": int(DEFAULT_RDA_STABILITY_SEGMENTS),
         "segment_peak_bins_dar": peak_bins.astype(np.int32).tolist(),
         "target_bin_scores": [float(x) for x in selected_scores.tolist()],
@@ -213,8 +214,10 @@ def select_target_bin_indices(
 def target_edacm_signal(
     radar: np.ndarray,
     top_bins: int = DEFAULT_EDACM_TOP_BINS,
+    hr_band_hz: Tuple[float, float] = DEFAULT_HR_BAND_HZ,
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
-    selected_bins, weights, score_meta = select_target_bin_indices(radar, top_bins=top_bins)
+    selected_bins, weights, score_meta = select_target_bin_indices(
+        radar, top_bins=top_bins, hr_band_hz=hr_band_hz)
     phases = []
     for d_idx, a_idx, r_idx in selected_bins:
         z = radar[:, int(d_idx), int(a_idx), int(r_idx)]
@@ -231,5 +234,4 @@ def target_edacm_signal(
         **score_meta,
     }
     return fused.astype(np.float32), meta
-
 

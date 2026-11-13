@@ -12,7 +12,7 @@ from typing import Any, Dict, Tuple
 
 import numpy as np
 
-from src.features.edacm import target_edacm_signal, zscore_1d
+from src.features.edacm import DEFAULT_HR_BAND_HZ, target_edacm_signal, zscore_1d
 from src.features.hr_adavmd import (
     DEFAULT_VMD_ALPHA,
     DEFAULT_VMD_K,
@@ -82,6 +82,9 @@ def rda_log_magnitude(radar: np.ndarray) -> np.ndarray:
 def radar_to_feature_bundle(
     radar: np.ndarray,
     representation: str,
+    hr_band_hz: Tuple[float, float] = DEFAULT_HR_BAND_HZ,
+    vmd_init_profile: str = "legacy",
+    include_rda: bool = True,
 ) -> Dict[str, Any]:
     if representation == "real_imag":
         x = np.stack([np.real(radar), np.imag(radar)], axis=0).astype(np.float32)
@@ -90,14 +93,16 @@ def radar_to_feature_bundle(
     elif representation == "log_magnitude":
         x = np.log1p(np.abs(radar)).astype(np.float32)
     elif representation == "target_edacm":
-        phase, phase_meta = target_edacm_signal(radar)
+        phase, phase_meta = target_edacm_signal(radar, hr_band_hz=hr_band_hz)
         x = phase[None, :].astype(np.float32)
         return {"x": x, "meta": phase_meta}
     elif representation in {"proposed", "target_edacm_vmd"}:
-        phase, phase_meta = target_edacm_signal(radar)
-        x_time, hr_adavmd_meta = hr_adavmd_decompose(phase, k=DEFAULT_VMD_K)
+        phase, phase_meta = target_edacm_signal(radar, hr_band_hz=hr_band_hz)
+        x_time, hr_adavmd_meta = hr_adavmd_decompose(
+            phase, k=DEFAULT_VMD_K, hr_band_hz=hr_band_hz,
+            init_profile=vmd_init_profile)
         x_freq, freq_hz, freq_meta = frequency_features(x_time)
-        x_rda = rda_log_magnitude(radar)
+        x_rda = rda_log_magnitude(radar) if include_rda else None
         phase_meta.update(
             {
                 "method_pipeline": list(METHOD_PIPELINE),
@@ -114,20 +119,21 @@ def radar_to_feature_bundle(
                 "feature_domains": ["time", "frequency"],
                 "x_time_shape": list(x_time.shape),
                 "x_freq_shape": list(x_freq.shape),
-                "x_rda_shape": list(x_rda.shape),
-                "x_rda_representation": DEFAULT_RDA_REPRESENTATION,
+                "x_rda_shape": list(x_rda.shape) if x_rda is not None else None,
+                "x_rda_representation": DEFAULT_RDA_REPRESENTATION if x_rda is not None else None,
                 **freq_meta,
             }
         )
-        return {
+        bundle = {
             "x": x_time.astype(np.float32),
             "x_time": x_time.astype(np.float32),
             "x_freq": x_freq.astype(np.float32),
-            "x_rda": x_rda.astype(np.float32),
             "freq_hz": freq_hz.astype(np.float32),
             "meta": phase_meta,
         }
+        if x_rda is not None:
+            bundle["x_rda"] = x_rda.astype(np.float32)
+        return bundle
     else:
         raise ValueError(f"Unsupported representation: {representation}")
     return {"x": x, "meta": {}}
-

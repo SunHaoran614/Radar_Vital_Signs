@@ -92,7 +92,8 @@ class BGT60TR13CDataLoader(BaseDataLoader):
         participant_id: int,
         distance: str,
         measurement_type: str = 'short',
-        apply_dc_correction: bool = False
+        apply_dc_correction: bool = False,
+        memory_map: bool = False,
     ) -> np.ndarray:
         """加载雷达原始数据。
         
@@ -100,7 +101,8 @@ class BGT60TR13CDataLoader(BaseDataLoader):
             participant_id: 受试者ID (1-8)
             distance: 测试距离 ('0.3m', '0.6m', '0.9m', '1.2m')
             measurement_type: 测量类型 ('short'=短时10分钟, 'long'=长时2小时)
-            apply_dc_correction: 是否应用DC偏移校正，默认True
+            apply_dc_correction: 是否应用DC偏移校正，默认False
+            memory_map: 只读内存映射原始数组；用于长录制，不能同时做 DC 校正
         
         Returns:
             雷达数据立方体，shape为(num_frames, num_rx, num_chirps, num_samples)
@@ -123,8 +125,10 @@ class BGT60TR13CDataLoader(BaseDataLoader):
         )
         
         # 读取NumPy文件
+        if memory_map and apply_dc_correction:
+            raise ValueError("memory_map=True 时不能同时应用 DC 校正")
         try:
-            radar_data = np.load(file_path)
+            radar_data = np.load(file_path, mmap_mode='r' if memory_map else None)
         except Exception as e:
             raise IOError(f"读取雷达数据失败: {file_path}, 错误: {e}")
         
@@ -140,6 +144,8 @@ class BGT60TR13CDataLoader(BaseDataLoader):
             )
         
         # 转换数据类型并应用DC校正
+        if memory_map:
+            return radar_data
         radar_data = radar_data.astype(np.float32)
         if apply_dc_correction:
             radar_data = self._apply_dc_correction(radar_data)
@@ -439,4 +445,3 @@ class BGT60TR13CDataLoader(BaseDataLoader):
             },
             'radar_params': self.get_radar_params()
         }
-

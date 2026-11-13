@@ -1,0 +1,16 @@
+name: radar_vital_signs_main
+
+services:
+  dev:
+    image: radar_vital_signs
+    container_name: radar_dev_main
+    working_dir: /Radar_Vital_Signs
+    network_mode: host
+    stdin_open: true
+    tty: true
+    command: ["sleep", "infinity"]
+    gpus: all
+    volumes:
+      - .:/Radar_Vital_Signs
+      # Set RADAR_DATA_ROOT to a local dataset directory; data is not bundled.
+      - ${RADAR_DATA_ROOT:-./data}:/Radar_Vital_Signs/Dataset

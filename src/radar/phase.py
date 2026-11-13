@@ -23,6 +23,8 @@ from typing import Any, Callable, Dict, Tuple
 
 import numpy as np
 
+from .numerics import magnitude_squared
+
 # --- shared helpers -------------------------------------------------------
 
 
@@ -34,27 +36,19 @@ def _select_target_bin(cube: np.ndarray) -> Tuple[int, int, int]:
     by ``src/radar/localization.py``; callers that have a target bin should pass
     it via the helper wrappers below.
     """
-    energy = np.mean(np.abs(cube) ** 2, axis=0)
+    energy = np.mean(magnitude_squared(cube), axis=0)
     d_idx, a_idx, r_idx = np.unravel_index(int(np.argmax(energy)), energy.shape)
     return int(d_idx), int(a_idx), int(r_idx)
 
 
 def _unwrap_phase(phase: np.ndarray) -> np.ndarray:
+    """Unwrap a trace while retaining the same offset at every sample.
+
+    The former loop retained the initial phase only at sample zero and made
+    later samples relative to it, injecting an artificial first-sample impulse.
+    """
     y = np.asarray(phase, dtype=np.float64)
-    out = np.empty_like(y)
-    out[0] = y[0]
-    cum = 0.0
-    prev = y[0]
-    for i in range(1, y.size):
-        diff = y[i] - prev
-        if diff > np.pi:
-            diff -= 2.0 * np.pi
-        elif diff < -np.pi:
-            diff += 2.0 * np.pi
-        cum += diff
-        out[i] = cum
-        prev = y[i]
-    return out.astype(np.float32)
+    return np.unwrap(y).astype(np.float32)
 
 
 def _zscore(x: np.ndarray) -> np.ndarray:
@@ -120,7 +114,9 @@ def phase_interframe_diff(
     if target_bin is None:
         target_bin = _select_target_bin(cube)
     d, a, r = target_bin
-    z = cube[:, int(d), int(a), int(r)].astype(np.complex64)
+    # Promote before the product: finite complex64 IQ may square outside the
+    # float32 range even though its phase is well defined.
+    z = cube[:, int(d), int(a), int(r)].astype(np.complex128)
     conj_prev = np.conj(z[:-1])
     prod = z[1:] * conj_prev
     delta = np.angle(prod).astype(np.float32)
@@ -149,7 +145,7 @@ def phase_multibin_fusion(
         normalize: see :func:`phase_single_bin`. Diagnostic callers pass False.
     """
     if target_bins is None:
-        energy = np.mean(np.abs(cube) ** 2, axis=0)
+        energy = np.mean(magnitude_squared(cube), axis=0)
         flat = np.argpartition(energy.reshape(-1), -top_bins)[-top_bins:]
         # np.unravel_index returns one array per axis; zip it to get per-bin
         # (d, a, r) tuples. Iterating it directly yields axis-index arrays and
@@ -177,7 +173,7 @@ def register_phase_methods() -> Dict[str, Callable[..., np.ndarray]]:
 
     Called from ``src/radar/__init__.py`` at import time. The phase stage is
     cross-layer (it returns a 1-D trace, not a cube), but it is still part of the
-    selectable front-end pool per docs/RDA_ALGORITHMS.md §2.
+    selectable front-end pool per docs/frontend.md §2.
     """
     from .pipeline import register_stage
 

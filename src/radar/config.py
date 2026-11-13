@@ -1,8 +1,8 @@
 """RDA configuration: one selectable method per processing stage.
 
-A single :class:`RDAConfig` fully describes a front-end pipeline. Swapping one
-stage (e.g. ``clutter="mti"`` -> ``clutter="pca"``) is a one-line change rather
-than a new code path, which is the whole point of the replaceable algorithm pool.
+A single :class:`RDAConfig` describes the post-conversion cube stages. The
+default is an identity transform: an experiment must explicitly select every
+spatial mask or weighting stage it intends to test.
 
 ``fs`` is the cube frame rate in Hz (a dataset property). It is injected into
 every cube stage that accepts an ``fs`` keyword, so stages never hardcode it.
@@ -17,17 +17,15 @@ from typing import Any, Dict, Optional
 from .pipeline import RDA_STAGE_REGISTRY, DEFAULT_FS
 
 
-# Default method per stage = the current baseline behaviour the project already
-# relied on implicitly (energy-based localization + global range crop + FFT
-# beamforming + no explicit clutter re-suppression since the cube is assumed
-# already static-removed). Keeping these as defaults means "no RDAConfig" ==
-# today's behaviour, so the rest of the pipeline is untouched.
+# The historical defaults applied energy localization and a second range mask
+# to an already cropped RDA cube. That was not the ADC exporter baseline.
+# Identity defaults prevent an unrequested spatial change to model inputs.
 @dataclass
 class RDAConfig:
     clutter: str = "none"
-    localization: str = "energy"
-    range_selection: str = "global_energy"
-    beamforming: str = "fft"
+    localization: str = "none"
+    range_selection: str = "none"
+    beamforming: str = "none"
     phase: str = "none"
 
     # Frame rate of the cube in Hz (dataset property, injected into cube stages).

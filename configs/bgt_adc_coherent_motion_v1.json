@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "target_doppler": 8,
+  "target_angle": 16,
+  "target_range": 8,
+  "chirp_selection_method": "all",
+  "clutter_method": "none",
+  "doppler_method": "full_center_bins",
+  "range_selection_method": "motion_zero_doppler",
+  "range_search_bins": [8, 60]
+}

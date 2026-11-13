@@ -43,7 +43,7 @@ RDARCube = np.ndarray  # complex64, shape (F, D, A, R)
 # stage name -> {method_name: callable}
 # Cube stages return a complex cube of the same (F,D,A,R) shape. The "phase"
 # stage is cross-layer: it consumes the localized cube and returns a 1-D phase
-# trace (see src/radar/phase.py and docs/RDA_ALGORITHMS.md §2 layer boundary).
+# trace (see src/radar/phase.py and docs/frontend.md §2 layer boundary).
 RDA_STAGE_REGISTRY: Dict[str, Dict[str, Callable[..., RDARCube]]] = {
     "clutter": {},
     "localization": {},
@@ -171,8 +171,9 @@ def apply_rda_pipeline(
         if record_meta:
             meta["phase"] = {"method": phase_method, "kwargs": phase_kwargs}
 
+    # Metadata must describe the same object returned by the phase-only call.
+    # With no selected phase stage, retain the documented cube fallback.
+    result = phase_trace if return_phase and phase_trace is not None else current
     if record_meta:
-        return current, meta
-    if return_phase:
-        return phase_trace
-    return current
+        return result, meta
+    return result

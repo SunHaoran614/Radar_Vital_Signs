@@ -92,6 +92,7 @@ class PhysDriveDataLoader(BaseDataLoader):
         sample_id: int,
         return_complex: bool = True,
         normalize_frames: bool = True,
+        sample_dir_name: Optional[str] = None,
     ) -> np.ndarray:
         """加载雷达数据。
         
@@ -102,9 +103,9 @@ class PhysDriveDataLoader(BaseDataLoader):
             normalize_frames: 是否将帧数标准化到600（短样本补零、长样本截断），默认True
         
         Returns:
-            雷达数据立方体:
-                - 如果return_complex=True: shape为(600, 8, 16, 8)，复数类型
-                - 如果return_complex=False: shape为(600, 2, 8, 16, 8)，实数类型
+            雷达数据立方体。normalize_frames=False 时保留原始帧数，
+            复数输出轴为 (frames, doppler, angle, range)，
+            实数输出轴为 (frames, real_imag, doppler, angle, range)。
         
         Raises:
             ValueError: 如果参数无效
@@ -115,7 +116,9 @@ class PhysDriveDataLoader(BaseDataLoader):
         self._validate_session_id(session_id)
         
         # 构建文件路径
-        file_path = self._build_sample_file_path(session_id, sample_id, 'mmwave.mat')
+        file_path = self._build_sample_file_path(
+            session_id, sample_id, 'mmwave.mat', sample_dir_name=sample_dir_name
+        )
         
         # 读取MAT文件
         try:
@@ -137,15 +140,10 @@ class PhysDriveDataLoader(BaseDataLoader):
                 f"数据形状不匹配。期望: {expected_shape}, 实际: {mmwave.shape}"
             )
 
-        # 仅帧数不一致时，可选择标准化到固定帧长
-        if mmwave.shape[0] != self.NUM_FRAMES:
-            if normalize_frames:
-                mmwave = self._normalize_mmwave_frames(mmwave, target_frames=self.NUM_FRAMES)
-            else:
-                expected_shape = (self.NUM_FRAMES,) + expected_tail
-                raise ValueError(
-                    f"数据形状不匹配。期望: {expected_shape}, 实际: {mmwave.shape}"
-                )
+        if mmwave.shape[0] == 0:
+            raise ValueError(f"雷达样本没有时间帧: {file_path}")
+        if normalize_frames and mmwave.shape[0] != self.NUM_FRAMES:
+            mmwave = self._normalize_mmwave_frames(mmwave, target_frames=self.NUM_FRAMES)
         
         # 转换为复数格式
         if return_complex:
@@ -156,7 +154,8 @@ class PhysDriveDataLoader(BaseDataLoader):
     def load_reference_data(
         self,
         session_id: str,
-        sample_id: int
+        sample_id: int,
+        sample_dir_name: Optional[str] = None,
     ) -> Dict[str, Any]:
         """加载参考数据（ECG和呼吸）。
 
@@ -174,8 +173,12 @@ class PhysDriveDataLoader(BaseDataLoader):
             IOError: 如果文件读取失败
         """
         # 构建文件路径
-        ecg_file = self._build_sample_file_path(session_id, sample_id, 'ecg.mat')
-        resp_file = self._build_sample_file_path(session_id, sample_id, 'resp.mat')
+        ecg_file = self._build_sample_file_path(
+            session_id, sample_id, 'ecg.mat', sample_dir_name=sample_dir_name
+        )
+        resp_file = self._build_sample_file_path(
+            session_id, sample_id, 'resp.mat', sample_dir_name=sample_dir_name
+        )
 
         # 读取ECG数据
         try:
@@ -398,7 +401,8 @@ class PhysDriveDataLoader(BaseDataLoader):
         self,
         session_id: str,
         sample_id: int,
-        filename: str
+        filename: str,
+        sample_dir_name: Optional[str] = None,
     ) -> Path:
         """构建样本文件路径。
 
@@ -416,6 +420,16 @@ class PhysDriveDataLoader(BaseDataLoader):
         session_dir = self.mmwave_path / session_id
         if not session_dir.exists():
             raise FileNotFoundError(f"会话目录不存在: {session_dir}")
+
+        if sample_dir_name is not None:
+            prefix = f"{session_id}_"
+            suffix = sample_dir_name[len(prefix):] if sample_dir_name.startswith(prefix) else ""
+            if not suffix.isdigit() or int(suffix) != sample_id:
+                raise ValueError(f"样本目录与编号不一致: {sample_dir_name}, {sample_id}")
+            exact_path = session_dir / sample_dir_name / filename
+            if not exact_path.is_file():
+                raise FileNotFoundError(f"文件不存在: {exact_path}")
+            return exact_path
 
         # 优先尝试常见两位格式
         candidates = [session_dir / f"{session_id}_{sample_id:02d}" / filename]

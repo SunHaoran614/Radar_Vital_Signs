@@ -2,8 +2,8 @@
 
 from pathlib import Path
 from typing import Dict, Any, List, Optional
+import csv
 import numpy as np
-import pandas as pd
 
 from .base_loader import BaseDataLoader
 
@@ -143,6 +143,23 @@ class FTUDataLoader(BaseDataLoader):
 
         # 重塑数据为数据立方体
         return self._reshape_radar_data(raw_data, num_frames=num_frames)
+
+    def open_radar_frame_view(
+        self, participant_id: int, scenario: str, distance: str, repeat: int,
+        max_frames: Optional[int] = None,
+    ) -> "FTURadarFrameView":
+        """Expose decoded frames on demand for two-pass ADC→RDA conversion."""
+        self._validate_parameters(participant_id, scenario, repeat)
+        folder = self._build_radar_file_path(participant_id, scenario, distance, repeat)
+        frames = self.NUM_FRAMES if max_frames is None else max_frames
+        if not 1 <= frames <= self.NUM_FRAMES:
+            raise ValueError(f"max_frames必须在1-{self.NUM_FRAMES}之间，得到: {frames}")
+        path = folder / "data_Raw_0.bin"
+        raw = np.memmap(path, dtype=np.int16, mode="r")
+        words_per_frame = self.NUM_ADC * self.NUM_RX * self.NUM_CHIRPS * 2
+        if raw.size != self.NUM_FRAMES * words_per_frame:
+            raise ValueError(f"FTU ADC length mismatch: {path}")
+        return FTURadarFrameView(self, raw, frames)
     
     def load_reference_data(
         self,
@@ -173,15 +190,18 @@ class FTUDataLoader(BaseDataLoader):
             participant_id, scenario, distance, repeat
         )
         
-        # 读取CSV文件（跳过前3行元数据）
+        # Polar's first three rows are metadata; the time and HR columns in
+        # subsequent rows are enough here, so no DataFrame dependency is needed.
         try:
-            df = pd.read_csv(hr_file, skiprows=3, header=None)
+            with hr_file.open(newline="", encoding="latin1") as handle:
+                rows = list(csv.reader(handle))[3:]
+            timestamps = np.asarray([row[1] for row in rows if len(row) > 2], dtype=str)
+            heart_rate = np.asarray([
+                float(row[2]) if row[2].strip() else np.nan
+                for row in rows if len(row) > 2
+            ], dtype=np.float32)
         except Exception as e:
             raise IOError(f"读取参考数据失败: {hr_file}, 错误: {e}")
-        
-        # 提取时间和心率列
-        timestamps = df.iloc[:, 1].values  # 第2列是时间
-        heart_rate = df.iloc[:, 2].values  # 第3列是心率
         
         # 转换时间格式 (HH:MM:SS -> 秒)
         timestamps_sec = self._convert_timestamps(timestamps)
@@ -280,13 +300,10 @@ class FTUDataLoader(BaseDataLoader):
         """
         scenario_folder = self.SCENARIO_MAP[scenario]
         
-        path = (
-            self.hr_ref_path /
-            f'Participant {participant_id}' /
-            scenario_folder /
-            distance /
-            f'R{repeat}.CSV'
-        )
+        base = self.hr_ref_path / f'Participant {participant_id}' / scenario_folder
+        # Elevated radar files live under "80 cm/<repeat>", but the supplied
+        # Polar reference CSVs live directly under "4. Elevated/R<repeat>.CSV".
+        path = (base if scenario == 'Elevated' else base / distance) / f'R{repeat}.CSV'
         
         if not path.exists():
             raise FileNotFoundError(f"参考文件不存在: {path}")
@@ -405,13 +422,10 @@ class FTUDataLoader(BaseDataLoader):
                             continue
 
                         radar_file = repeat_dir / 'data_Raw_0.bin'
+                        hr_base = self.hr_ref_path / f'Participant {pid}' / scenario_folder
                         hr_file = (
-                            self.hr_ref_path /
-                            f'Participant {pid}' /
-                            scenario_folder /
-                            distance_dir.name /
-                            f'R{rep}.CSV'
-                        )
+                            hr_base if scene == 'Elevated' else hr_base / distance_dir.name
+                        ) / f'R{rep}.CSV'
 
                         if radar_file.exists() and hr_file.exists():
                             records.append({
@@ -470,3 +484,27 @@ class FTUDataLoader(BaseDataLoader):
                 'frame_rate': '20 fps'
             }
         }
+
+
+class FTURadarFrameView:
+    """Read-only, indexable raw ADC view with one decoded frame in memory."""
+
+    def __init__(self, loader: "FTUDataLoader", raw: np.memmap, frames: int):
+        self._loader = loader
+        self._raw = raw
+        self.shape = (frames, loader.NUM_RX, loader.NUM_CHIRPS, loader.NUM_ADC)
+        self.ndim = 4
+        self.dtype = np.dtype(np.complex64)
+        self._words_per_frame = loader.NUM_ADC * loader.NUM_RX * loader.NUM_CHIRPS * 2
+
+    def __getitem__(self, index: int) -> np.ndarray:
+        if not isinstance(index, (int, np.integer)):
+            raise TypeError("FTURadarFrameView supports integer frame indices only")
+        frame = int(index)
+        if frame < 0:
+            frame += self.shape[0]
+        if not 0 <= frame < self.shape[0]:
+            raise IndexError(frame)
+        start = frame * self._words_per_frame
+        words = self._raw[start:start + self._words_per_frame]
+        return self._loader._reshape_radar_data(words, num_frames=1)[0]

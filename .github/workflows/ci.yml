@@ -1,7 +1,6 @@
 name: CI
 on:
   push:
-    branches: ["main"]
   pull_request:
 
 jobs:
@@ -9,24 +8,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up Miniconda
-        uses: conda-incubator/setup-miniconda@v3
+      - uses: actions/setup-python@v5
         with:
-          auto-activate-base: false
-          activate-environment: radar
-          environment-file: environment.yml
-          use-mamba: true
-
-      - name: Lint
-        shell: bash -l {0}
-        run: ruff check .
-
-      - name: Tests
-        shell: bash -l {0}
-        run: |
-          if [ -d tests ]; then
-            pytest -q
-          else
-            echo "No tests/ directory found, skipping tests."
-          fi
+          python-version: '3.12'
+          cache: pip
+      - name: Install maintained package
+        run: python -m pip install -e '.[dev]'
+      - name: Check public repository
+        run: python scripts/check_release.py
+      - name: Run self-contained tests
+        run: python -m pytest -q

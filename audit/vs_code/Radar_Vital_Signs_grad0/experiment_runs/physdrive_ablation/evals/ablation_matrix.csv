@@ -1,7 +1,0 @@
-setting,name,n,mae_bpm,rmse_bpm,pearson_r,source_path
-1_source_only,"① source-only (A→C, no adapt)",264,10.516,12.556,0.0141,/kaggle/working/evals/eval_cross_source_only.json
-2_sfda_before,② (SFDA before),264,10.516,12.556,0.0141,/kaggle/working/model_outputs/tcn_sfda_C/summary.json
-2_sfda_after,② +SFDA full,264,10.442,12.372,-0.1249,/kaggle/working/model_outputs/tcn_sfda_C/summary.json
-3_oracle,③ in-domain oracle (C),264,10.249,12.229,0.0365,/kaggle/working/model_outputs/tcn_oracle_C/eval_test.json
-tcn_sfda_C_notemp,② -temporal-smoothing,264,10.673,12.671,-0.0921,/kaggle/working/model_outputs/tcn_sfda_C_notemp/summary.json
-tcn_sfda_C_noconf,② -confidence-weighting,264,10.382,12.305,-0.1102,/kaggle/working/model_outputs/tcn_sfda_C_noconf/summary.json

@@ -1,0 +1,2 @@
+# Install the maintained package with development dependencies.
+-e .[dev]

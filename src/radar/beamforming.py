@@ -1,14 +1,13 @@
-"""Beamforming / angle-processing stage across RX channels.
+"""Experimental angle-bin weighting stage for an already converted cube.
 
-The angle axis (axis 2) represents spatial samples across RX antennas. Simple FFT
-beamforming is the current baseline; this stage exposes alternatives that apply a
-spatial filter across the angle axis. To preserve the (F, D, A, R) shape contract
-we keep the same number of angle bins but apply a spatial filter that reweights /
-steers them. The result is a cube where the angular response is shaped by the
-chosen beamformer (e.g. MVDR suppresses spatially-incoherent clutter).
+The angle axis can contain angle FFT bins or raw antenna channels, depending on
+the loader. This module receives no provenance or array calibration. The
+``bartlett`` and ``mvdr`` implementations below are angle-bin weighting proxies;
+they must not be interpreted as physical beamformers or used to claim an MVDR
+benefit. Real beamforming belongs before the angle FFT on calibrated RX IQ.
 
-Candidate matrix rows: B0 (FFT, current), B1 (Bartlett / conventional),
-B2 (MVDR / Capon adaptive).
+Candidate matrix rows: B0 (identity on input spatial axis), B1/B2 (uncalibrated
+proxies requiring replacement before any physical beamforming claim).
 """
 
 from __future__ import annotations
@@ -25,7 +24,7 @@ def _complex_safe(x: np.ndarray) -> np.ndarray:
 
 
 def _angle_covariance(cube: np.ndarray) -> np.ndarray:
-    """Spatial covariance over the angle axis, averaged over (F, D, R).
+    """Covariance of the input angle bins, averaged over (F, D, R).
 
     Returns (A, A) complex matrix.
     """
@@ -37,20 +36,15 @@ def _angle_covariance(cube: np.ndarray) -> np.ndarray:
 
 
 def beamforming_fft(cube: np.ndarray, **_: Any) -> np.ndarray:
-    """B0: current baseline -- FFT along the angle axis (identity in our cube since
-    the loader already provides angle-resolved bins). Returns cube unchanged but
-    kept explicit so the stage is always meaningful."""
+    """B0: identity on an existing cube; does not compute an angle FFT here."""
     return _complex_safe(cube)
 
 
 def beamforming_bartlett(cube: np.ndarray, look_directions: int = 16, **_: Any) -> np.ndarray:
-    """B1: conventional (Bartlett) beamformer -- steer a spatial filter and
-    re-project the cube onto the angle axis.
+    """B1: uncalibrated angle-bin spectral weighting proxy.
 
-    For each angle bin we form a steering vector across the RX axis and compute
-    the Bartlett spectrum, then re-weight each angle bin by its mean Bartlett
-    power (broadening/keeping the dominant direction, attenuating others). Shape
-    is preserved.
+    A synthetic steering vector reweights the input bins. If those bins already
+    contain an angle FFT, this calculation has no calibrated RX-domain meaning.
     """
     cube = _complex_safe(cube)
     f, d, a, r = cube.shape
@@ -73,14 +67,11 @@ def beamforming_bartlett(cube: np.ndarray, look_directions: int = 16, **_: Any) 
 
 
 def beamforming_mvdr(cube: np.ndarray, diag_load: float = 1e-2, **_: Any) -> np.ndarray:
-    """B2: MVDR / Capon adaptive beamformer -- suppress spatially incoherent
-    interference (e.g. multipath inside a car cabin) while keeping the steered
-    direction.
+    """B2: uncalibrated covariance-based angle-bin weighting proxy.
 
-    For each angle bin we estimate the spatial covariance across RX, invert it
-    with a diagonal load for stability, and form the MVDR filter; the resulting
-    angular response reweights the cube. This is the stage that answers "does
-    angular sophistication help?" without leaving the shape contract.
+    Covariance across input bins and synthetic steering vectors yield a weight.
+    The input bins may already be angle FFT outputs, so this is not a physical
+    RX-domain MVDR beamformer.
     """
     cube = _complex_safe(cube)
     f, d, a, r = cube.shape

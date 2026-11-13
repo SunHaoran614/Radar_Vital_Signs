@@ -32,6 +32,8 @@ def read_manifest(manifest_path: Path) -> List[Dict[str, str]]:
 
 def resolve_window_path(raw_path: str, export_dir: Path) -> Path:
     path = Path(raw_path)
+    if not path.is_absolute():
+        return export_dir / path
     if path.exists():
         return path
     marker = "training_exports/"
@@ -112,10 +114,48 @@ class RadarWindowDataset(Dataset):
         }
 
 
+class RadarUnlabeledWindowDataset(Dataset):
+    """Target-domain radar windows with no HR fields exposed to adaptation."""
+
+    def __init__(self, export_dir: str | Path, split: str, datasets: set[str]) -> None:
+        self.export_dir = Path(export_dir)
+        self.split = split
+        allowed = {"window_path", "dataset", "group_key", "sample_tag", "window_start", "window_end"}
+        self.rows = [
+            {key: row[key] for key in allowed if key in row}
+            for row in read_manifest(self.export_dir / "manifest.csv")
+            if row.get("split") == split and row.get("dataset") in datasets
+        ]
+        if not self.rows:
+            raise ValueError(f"No unlabeled target rows for split={split!r}, datasets={datasets}")
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def __getitem__(self, index: int) -> Dict[str, Tensor | str]:
+        row = self.rows[index]
+        path = resolve_window_path(row["window_path"], self.export_dir)
+        with np.load(path, allow_pickle=False) as data:
+            x_time = torch.from_numpy(data["x_time"].astype(np.float32, copy=False))
+            x_freq = torch.from_numpy(data["x_freq"].astype(np.float32, copy=False))
+        return {
+            "row_index": torch.tensor(index, dtype=torch.long),
+            "x_time": x_time,
+            "x_freq": x_freq,
+            "dataset": row.get("dataset", ""),
+            "group_key": row.get("group_key", ""),
+            "sample_tag": row.get("sample_tag", ""),
+            "window_start": row.get("window_start", ""),
+            "window_end": row.get("window_end", ""),
+            "window_path": str(path),
+        }
+
+
 def build_datasets(
     export_dir: str | Path,
     datasets: Optional[set[str]] = None,
-) -> tuple[RadarWindowDataset, RadarWindowDataset, RadarWindowDataset, LabelStats]:
+    include_test: bool = False,
+) -> tuple[RadarWindowDataset, RadarWindowDataset, RadarWindowDataset | None, LabelStats]:
     export_dir = Path(export_dir)
     rows = read_manifest(export_dir / "manifest.csv")
     train_rows = [
@@ -128,5 +168,6 @@ def build_datasets(
     stats = compute_label_stats(train_rows)
     train = RadarWindowDataset(export_dir, "train", label_stats=stats, datasets=datasets)
     val = RadarWindowDataset(export_dir, "val", label_stats=stats, datasets=datasets)
-    test = RadarWindowDataset(export_dir, "test", label_stats=stats, datasets=datasets)
+    test = (RadarWindowDataset(export_dir, "test", label_stats=stats, datasets=datasets)
+            if include_test else None)
     return train, val, test, stats

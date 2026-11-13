@@ -24,6 +24,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import sys
 
 import numpy as np
+from scipy.signal import resample_poly
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
@@ -36,6 +37,7 @@ from src.features.edacm import (
     DEFAULT_RDA_STABILITY_SEGMENTS,
 )
 from src.features.hr_adavmd import (
+    DECOMPOSITION_ALGORITHM_VERSION,
     DEFAULT_RESP_BAND_HZ,
     DEFAULT_SAMPLING_RATE_HZ,
     DEFAULT_VMD_ALPHA,
@@ -62,14 +64,23 @@ DEFAULT_SPLIT_RATIOS = (0.7, 0.15, 0.15)
 DEFAULT_BGT_LONG_SPLIT = "test"
 DEFAULT_REPRESENTATION = "proposed"
 DEFAULT_SPLIT_MODE = "balanced_grouped"
+SOURCE_SAMPLING_RATE_HZ = {"FTU": 20.0, "BGT60TR13C": 30.0, "PhysDrive": 20.0}
+SOURCE_HR_BAND_HZ = {
+    "FTU": (0.75, 3.5),  # Elevated Polar reference includes >150 BPM.
+    "BGT60TR13C": DEFAULT_HR_BAND_HZ,
+    "PhysDrive": DEFAULT_HR_BAND_HZ,
+}
+SOURCE_VMD_INIT_PROFILE = {dataset: "legacy" for dataset in SOURCE_HR_BAND_HZ}
 BALANCED_EXHAUSTIVE_MAX_GROUPS = 14
 FTU_SPECIAL_PARTICIPANTS = ("2", "5", "6")
 FTU_ELEVATED_HR_PARTICIPANTS = ("2", "3", "4", "6")
 DEFAULT_PARTICIPANT_SPLITS = {
     "FTU": {
-        "train": ("2", "3", "4", "5", "7", "9"),
-        "val": ("6", "10"),
-        "test": ("1", "8"),
+        # Frozen FTU source protocol used by training_exports_protocol_v2 and
+        # all raw-ADC train/val diagnostics. Test participants remain sealed.
+        "train": ("1", "2", "4", "7", "8", "9"),
+        "val": ("5", "6"),
+        "test": ("3", "10"),
     },
     "BGT60TR13C": {
         "train": ("1", "2", "4", "6", "7", "8"),
@@ -140,9 +151,19 @@ def parse_args() -> argparse.Namespace:
         "--drop-rda",
         action="store_true",
         help=(
-            "Do not persist the per-window RDA cube (x_rda). No training entrypoint "
-            "reads x_rda; dropping it saves ~1 MB and measurable I/O per window."
+            "Skip construction and storage of per-window x_rda. No current training "
+            "entrypoint reads it; this saves memory and I/O per window."
         ),
+    )
+    parser.add_argument(
+        "--diagnostic-only",
+        action="store_true",
+        help="Mark built windows as ineligible for source-model training.",
+    )
+    parser.add_argument(
+        "--only-splits", nargs="+", choices=("train", "val", "test"),
+        default=None,
+        help="Build windows only for these already assigned splits; other sample arrays stay unopened.",
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
@@ -329,12 +350,19 @@ def default_participant_split(
         for participant_ids in spec.values()
         for participant_id in participant_ids
     }
-    if requested != set(group_by_participant):
+    available = set(group_by_participant)
+    if dataset == "FTU":
+        # Diagnostic subsets still keep each observed participant in its frozen
+        # split; never silently reassign a sealed test subject by hash.
+        if not available or not available.issubset(requested) or len(group_by_participant) != len(unique_groups):
+            return None
+    elif requested != available:
         return None
     return {
         group_by_participant[participant_id]: split
         for split, participant_ids in spec.items()
         for participant_id in participant_ids
+        if participant_id in group_by_participant
     }
 
 
@@ -641,6 +669,12 @@ def build_domain_split_map(
     }
     for dataset, group_keys in groups_by_dataset.items():
         dataset_forced_test = forced_test_groups if dataset == "BGT60TR13C" else set()
+        if dataset == "FTU":
+            frozen = default_participant_split(dataset, group_keys)
+            if frozen is None:
+                raise ValueError("FTU participants do not match frozen source protocol; refusing an implicit resplit")
+            split_map.update(frozen)
+            continue
         if split_mode == "balanced_grouped":
             split_map.update(
                 balanced_split_group_keys(
@@ -737,444 +771,7 @@ def collect_exported_samples(exports_dir: Path, datasets: Sequence[str]) -> List
     return samples
 
 
-# Feature extraction is implemented in src.features.* so this builder stays focused on
-# window slicing, label alignment, split assignment, and artifact writing.
-def detrend_linear(x: np.ndarray) -> np.ndarray:
-    y = np.asarray(x, dtype=np.float32).reshape(-1)
-    if y.size <= 1:
-        return y - np.nanmean(y)
-    t = np.linspace(-1.0, 1.0, y.size, dtype=np.float32)
-    valid = np.isfinite(y)
-    if int(valid.sum()) < 2:
-        return np.nan_to_num(y - np.nanmean(y), nan=0.0).astype(np.float32)
-    slope, intercept = np.polyfit(t[valid], y[valid], deg=1)
-    out = y - (slope * t + intercept).astype(np.float32)
-    out[~np.isfinite(out)] = 0.0
-    return out.astype(np.float32)
-
-
-def zscore_1d(x: np.ndarray) -> np.ndarray:
-    y = np.asarray(x, dtype=np.float32).copy()
-    if y.size == 0 or not np.isfinite(y).any():
-        return np.zeros_like(y, dtype=np.float32)
-    mean = float(np.nanmean(y))
-    std = float(np.nanstd(y))
-    if np.isfinite(std) and std > 1e-6:
-        y = (y - mean) / std
-    else:
-        y = y - mean
-    y[~np.isfinite(y)] = 0.0
-    return y.astype(np.float32)
-
-
-def edacm_phase(z: np.ndarray, eps: float = 1e-6) -> np.ndarray:
-    series = np.asarray(z, dtype=np.complex64).reshape(-1)
-    i = np.real(series).astype(np.float32)
-    q = np.imag(series).astype(np.float32)
-    di = np.diff(i, prepend=i[:1])
-    dq = np.diff(q, prepend=q[:1])
-    denom = i * i + q * q + np.float32(eps)
-    delta_phase = (i * dq - q * di) / denom
-    phase = np.cumsum(delta_phase, dtype=np.float32)
-    return detrend_linear(phase)
-
-
-def minmax_score(values: np.ndarray) -> np.ndarray:
-    x = np.asarray(values, dtype=np.float32)
-    if x.size == 0:
-        return x
-    finite = np.isfinite(x)
-    if not finite.any():
-        return np.zeros_like(x, dtype=np.float32)
-    lo = float(np.min(x[finite]))
-    hi = float(np.max(x[finite]))
-    if hi - lo <= 1e-8:
-        return np.ones_like(x, dtype=np.float32)
-    out = (x - lo) / (hi - lo)
-    out[~np.isfinite(out)] = 0.0
-    return out.astype(np.float32)
-
-
-def phase_stability_score(phase: np.ndarray) -> float:
-    y = zscore_1d(phase)
-    if y.size < 4:
-        return 0.0
-    diff = np.diff(y)
-    roughness = float(np.nanstd(diff))
-    if not np.isfinite(roughness):
-        return 0.0
-    return float(1.0 / (1.0 + roughness))
-
-
-def hr_band_peak_score(
-    phase: np.ndarray,
-    sampling_rate_hz: float = DEFAULT_SAMPLING_RATE_HZ,
-    band_hz: Tuple[float, float] = DEFAULT_HR_BAND_HZ,
-) -> float:
-    y = zscore_1d(phase)
-    n = int(y.size)
-    if n < 8:
-        return 0.0
-    window = np.hanning(n).astype(np.float32)
-    spectrum = np.abs(np.fft.rfft(y * window)).astype(np.float32)
-    freqs = np.fft.rfftfreq(n, d=1.0 / float(sampling_rate_hz)).astype(np.float32)
-    valid = (freqs >= float(band_hz[0])) & (freqs <= float(band_hz[1]))
-    if not valid.any():
-        return 0.0
-    total = float(np.sum(spectrum[1:]) + 1e-8)
-    band = spectrum[valid]
-    peak = float(np.max(band)) if band.size else 0.0
-    band_energy = float(np.sum(band))
-    if not np.isfinite(peak) or not np.isfinite(band_energy):
-        return 0.0
-    peak_concentration = peak / (float(np.mean(band)) + 1e-8) if band.size else 0.0
-    band_ratio = band_energy / total
-    return float(np.log1p(max(0.0, peak_concentration)) * max(0.0, band_ratio))
-
-
-def segment_peak_bins(
-    radar: np.ndarray,
-    segments: int = DEFAULT_RDA_STABILITY_SEGMENTS,
-) -> np.ndarray:
-    n_frames = int(radar.shape[0])
-    n_segments = min(max(1, int(segments)), max(1, n_frames))
-    peaks: List[np.ndarray] = []
-    for idx in range(n_segments):
-        start = int(round(idx * n_frames / n_segments))
-        end = int(round((idx + 1) * n_frames / n_segments))
-        if end <= start:
-            continue
-        energy = np.mean(np.abs(radar[start:end]) ** 2, axis=0)
-        peaks.append(np.asarray(np.unravel_index(int(np.argmax(energy)), energy.shape), dtype=np.float32))
-    if not peaks:
-        energy = np.mean(np.abs(radar) ** 2, axis=0)
-        peaks.append(np.asarray(np.unravel_index(int(np.argmax(energy)), energy.shape), dtype=np.float32))
-    return np.stack(peaks, axis=0)
-
-
-def spatial_consistency_scores(candidate_bins: np.ndarray, peak_bins: np.ndarray) -> np.ndarray:
-    candidates = np.asarray(candidate_bins, dtype=np.float32)
-    peaks = np.asarray(peak_bins, dtype=np.float32)
-    if candidates.size == 0 or peaks.size == 0:
-        return np.zeros((candidates.shape[0],), dtype=np.float32)
-    axis_scale = np.maximum(np.ptp(peaks, axis=0), 1.0).astype(np.float32)
-    scores = []
-    for candidate in candidates:
-        dist = np.linalg.norm((peaks - candidate[None, :]) / axis_scale[None, :], axis=1)
-        scores.append(float(np.mean(np.exp(-dist))))
-    return np.asarray(scores, dtype=np.float32)
-
-
-def select_target_bin_indices(
-    radar: np.ndarray,
-    top_bins: int,
-) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
-    energy = np.mean(np.abs(radar) ** 2, axis=0)
-    flat = energy.reshape(-1)
-    count = min(max(1, int(top_bins)), int(flat.size))
-    candidate_count = min(
-        int(flat.size),
-        max(count, count * DEFAULT_EDACM_CANDIDATE_MULTIPLIER),
-    )
-    candidate_flat = np.argpartition(flat, -candidate_count)[-candidate_count:]
-    candidate_multi = np.asarray(np.unravel_index(candidate_flat, energy.shape)).T.astype(np.int32)
-
-    phase_stability = []
-    hr_peak = []
-    for d_idx, a_idx, r_idx in candidate_multi:
-        phase = edacm_phase(radar[:, int(d_idx), int(a_idx), int(r_idx)])
-        phase_stability.append(phase_stability_score(phase))
-        hr_peak.append(hr_band_peak_score(phase))
-
-    peak_bins = segment_peak_bins(radar)
-    energy_scores = minmax_score(np.log1p(flat[candidate_flat]))
-    phase_scores = minmax_score(np.asarray(phase_stability, dtype=np.float32))
-    hr_scores = minmax_score(np.asarray(hr_peak, dtype=np.float32))
-    spatial_scores = minmax_score(spatial_consistency_scores(candidate_multi, peak_bins))
-    combined = (
-        0.35 * energy_scores
-        + 0.25 * phase_scores
-        + 0.25 * hr_scores
-        + 0.15 * spatial_scores
-    ).astype(np.float32)
-
-    order = np.argsort(combined)[::-1][:count]
-    selected_multi = candidate_multi[order].astype(np.int32)
-    selected_scores = combined[order].astype(np.float32)
-    selected_energy = flat[candidate_flat[order]].astype(np.float32)
-    weights = selected_scores.copy()
-    if float(np.sum(weights)) <= 1e-12:
-        weights = np.full(count, 1.0 / count, dtype=np.float32)
-    else:
-        weights = weights / np.sum(weights)
-    score_meta = {
-        "target_selection_method": "rda_vital_sign_stability_score",
-        "candidate_bins": int(candidate_count),
-        "score_weights": {
-            "energy": 0.35,
-            "phase_stability": 0.25,
-            "hr_band_peak": 0.25,
-            "spatial_consistency": 0.15,
-        },
-        "hr_band_hz": [float(DEFAULT_HR_BAND_HZ[0]), float(DEFAULT_HR_BAND_HZ[1])],
-        "spatial_stability_segments": int(DEFAULT_RDA_STABILITY_SEGMENTS),
-        "segment_peak_bins_dar": peak_bins.astype(np.int32).tolist(),
-        "target_bin_scores": [float(x) for x in selected_scores.tolist()],
-        "target_bin_energy": [float(x) for x in selected_energy.tolist()],
-        "target_bin_energy_score": [float(x) for x in energy_scores[order].tolist()],
-        "target_bin_phase_stability_score": [float(x) for x in phase_scores[order].tolist()],
-        "target_bin_hr_band_peak_score": [float(x) for x in hr_scores[order].tolist()],
-        "target_bin_spatial_consistency_score": [float(x) for x in spatial_scores[order].tolist()],
-        "rda_spatial_confidence": float(np.sum(selected_scores * weights)),
-    }
-    return selected_multi, weights.astype(np.float32), score_meta
-
-
-def target_edacm_signal(
-    radar: np.ndarray,
-    top_bins: int = DEFAULT_EDACM_TOP_BINS,
-) -> Tuple[np.ndarray, Dict[str, Any]]:
-    selected_bins, weights, score_meta = select_target_bin_indices(radar, top_bins=top_bins)
-    phases = []
-    for d_idx, a_idx, r_idx in selected_bins:
-        z = radar[:, int(d_idx), int(a_idx), int(r_idx)]
-        phases.append(edacm_phase(z))
-    stacked = np.stack(phases, axis=0).astype(np.float32)
-    fused = np.sum(stacked * weights[:, None], axis=0)
-    fused = zscore_1d(fused)
-    meta = {
-        "phase_method": "EDACM",
-        "edacm_top_bins": int(top_bins),
-        "target_bins_dar": selected_bins.tolist(),
-        "target_bin_weights": [float(x) for x in weights.tolist()],
-        "phase_preprocess": "linear_detrend_zscore",
-        **score_meta,
-    }
-    return fused.astype(np.float32), meta
-
-
-def vmd_decompose(
-    signal: np.ndarray,
-    k: int = DEFAULT_VMD_K,
-    alpha: float = DEFAULT_VMD_ALPHA,
-    max_iter: int = DEFAULT_VMD_MAX_ITER,
-    tol: float = DEFAULT_VMD_TOL,
-    init_omega: Optional[np.ndarray] = None,
-) -> np.ndarray:
-    """Variational mode decomposition for one real-valued fixed-length signal."""
-    x = zscore_1d(signal)
-    n = int(x.size)
-    if n == 0:
-        return np.empty((k, 0), dtype=np.float32)
-    if not np.isfinite(x).any():
-        return np.zeros((k, n), dtype=np.float32)
-
-    freqs = np.fft.fftfreq(n).astype(np.float64)
-    # 归一化频谱 (除以 n), 避免 FFT 幅值随 n 增长导致数值溢出
-    spectrum = (np.fft.fft(x) / n).astype(np.complex128)
-    positive = freqs >= 0
-
-    u_hat = np.zeros((k, n), dtype=np.complex128)
-    if init_omega is None:
-        omega = np.linspace(0.0, 0.5, k + 2, dtype=np.float64)[1:-1]
-    else:
-        omega = np.asarray(init_omega, dtype=np.float64).reshape(-1)
-        if omega.size != k:
-            raise ValueError(f"init_omega must contain {k} value(s)")
-        omega = np.clip(omega, 0.0, 0.5).astype(np.float64)
-    lambda_hat = np.zeros(n, dtype=np.complex128)
-    tau = 1e-3  # 对偶上升步长 (原为 0, 导致约束永不生效)
-
-    for _ in range(max_iter):
-        previous = u_hat.copy()
-        for mode_idx in range(k):
-            # 注意: others 需即时计算 (mode 间竞争), 不能用循环外的旧 sum
-            others = np.sum(u_hat, axis=0) - u_hat[mode_idx]
-            residual = spectrum - others - lambda_hat / 2.0
-            denom = 1.0 + alpha * (freqs - omega[mode_idx]) ** 2
-            update = residual / denom
-            update = np.nan_to_num(update, nan=0.0, posinf=0.0, neginf=0.0)
-            u_hat[mode_idx] = update
-            power = np.abs(u_hat[mode_idx, positive]) ** 2
-            power_sum = float(np.sum(power))
-            if np.isfinite(power_sum) and power_sum > 1e-12:
-                new_omega = float(np.sum(freqs[positive] * power) / power_sum)
-                if np.isfinite(new_omega):
-                    omega[mode_idx] = float(np.clip(new_omega, 0.0, 0.5))
-        lambda_hat = lambda_hat + tau * (np.sum(u_hat, axis=0) - spectrum)
-        diff = np.linalg.norm(u_hat - previous) / (np.linalg.norm(previous) + 1e-12)
-        if not np.isfinite(diff):
-            u_hat = previous
-            break
-        if diff < tol:
-            break
-
-    modes = np.real(np.fft.ifft(u_hat, axis=1) * n).astype(np.float64)
-    modes[~np.isfinite(modes)] = 0.0
-    return np.stack([zscore_1d(mode) for mode in modes], axis=0).astype(np.float32)
-
-
-def hr_adavmd_initial_omega(
-    k: int,
-    sampling_rate_hz: float = DEFAULT_SAMPLING_RATE_HZ,
-) -> np.ndarray:
-    """Physiology-guided VMD center-frequency initialization."""
-    base_hz = np.asarray([0.2, 0.45, 0.8, 1.1, 1.45, 1.9, 2.4, 3.2, 4.2], dtype=np.float32)
-    if k <= base_hz.size:
-        centers_hz = base_hz[:k]
-    else:
-        extra = np.linspace(float(base_hz[-1]), sampling_rate_hz / 2.0, k - base_hz.size + 2, dtype=np.float32)[1:-1]
-        centers_hz = np.concatenate([base_hz, extra])
-    return np.clip(centers_hz / float(sampling_rate_hz), 0.0, 0.5).astype(np.float32)
-
-
-def band_energy(power: np.ndarray, freq_hz: np.ndarray, band_hz: Tuple[float, float]) -> float:
-    mask = (freq_hz >= float(band_hz[0])) & (freq_hz <= float(band_hz[1]))
-    if not np.any(mask):
-        return 0.0
-    return float(np.sum(power[mask]))
-
-
-def hr_adavmd_mode_scores(
-    modes: np.ndarray,
-    sampling_rate_hz: float = DEFAULT_SAMPLING_RATE_HZ,
-    hr_band_hz: Tuple[float, float] = DEFAULT_HR_BAND_HZ,
-    resp_band_hz: Tuple[float, float] = DEFAULT_RESP_BAND_HZ,
-) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
-    time_modes = np.asarray(modes, dtype=np.float32)
-    n = int(time_modes.shape[-1])
-    if n <= 1:
-        weights = np.ones(time_modes.shape[0], dtype=np.float32)
-        scores = np.ones(time_modes.shape[0], dtype=np.float32)
-        return weights, scores, {
-            "hr_band_hz": list(hr_band_hz),
-            "resp_band_hz": list(resp_band_hz),
-            "mode_scores": scores.tolist(),
-            "mode_weights": weights.tolist(),
-        }
-
-    freq_hz = np.fft.rfftfreq(n, d=1.0 / float(sampling_rate_hz)).astype(np.float32)
-    raw_scores: List[float] = []
-    diagnostics: List[Dict[str, float]] = []
-    for mode in time_modes:
-        spectrum = np.fft.rfft(zscore_1d(mode) * np.hanning(n).astype(np.float32))
-        power = np.abs(spectrum).astype(np.float32) ** 2
-        total = float(np.sum(power)) + 1e-12
-        hr_energy = band_energy(power, freq_hz, hr_band_hz)
-        resp_energy = band_energy(power, freq_hz, resp_band_hz)
-        high_energy = band_energy(power, freq_hz, (float(hr_band_hz[1]), float(freq_hz[-1]) if freq_hz.size else hr_band_hz[1]))
-        hr_mask = (freq_hz >= float(hr_band_hz[0])) & (freq_hz <= float(hr_band_hz[1]))
-        if np.any(hr_mask):
-            hr_power = power[hr_mask]
-            peak_sharpness = float(np.max(hr_power) / (np.mean(hr_power) + 1e-12))
-        else:
-            peak_sharpness = 0.0
-        hr_ratio = hr_energy / total
-        resp_ratio = resp_energy / total
-        high_ratio = high_energy / total
-        score = 0.70 * hr_ratio + 0.20 * np.tanh(peak_sharpness / 5.0) - 0.25 * resp_ratio - 0.10 * high_ratio
-        raw_scores.append(float(score))
-        diagnostics.append(
-            {
-                "hr_ratio": float(hr_ratio),
-                "resp_ratio": float(resp_ratio),
-                "high_ratio": float(high_ratio),
-                "peak_sharpness": float(peak_sharpness),
-                "score": float(score),
-            }
-        )
-
-    scores = np.asarray(raw_scores, dtype=np.float32)
-    scores = scores - float(np.min(scores))
-    if float(np.max(scores)) > 1e-6:
-        scores = scores / float(np.max(scores))
-    else:
-        scores = np.ones_like(scores, dtype=np.float32)
-    weights = 0.5 + 0.5 * scores
-    return weights.astype(np.float32), scores.astype(np.float32), {
-        "hr_band_hz": list(hr_band_hz),
-        "resp_band_hz": list(resp_band_hz),
-        "mode_scores": [float(x) for x in scores.tolist()],
-        "mode_weights": [float(x) for x in weights.tolist()],
-        "mode_diagnostics": diagnostics,
-    }
-
-
-def hr_adavmd_decompose(
-    signal: np.ndarray,
-    k: int = DEFAULT_VMD_K,
-    alpha: float = DEFAULT_VMD_ALPHA,
-    max_iter: int = DEFAULT_VMD_MAX_ITER,
-    tol: float = DEFAULT_VMD_TOL,
-    sampling_rate_hz: float = DEFAULT_SAMPLING_RATE_HZ,
-) -> Tuple[np.ndarray, Dict[str, Any]]:
-    """Heart-rate-aware adaptive VMD for radar micro-motion signals."""
-    init_omega = hr_adavmd_initial_omega(k=k, sampling_rate_hz=sampling_rate_hz)
-    modes = vmd_decompose(
-        signal=signal,
-        k=k,
-        alpha=alpha,
-        max_iter=max_iter,
-        tol=tol,
-        init_omega=init_omega,
-    )
-    weights, scores, score_meta = hr_adavmd_mode_scores(
-        modes,
-        sampling_rate_hz=sampling_rate_hz,
-    )
-    weighted_modes = (modes * weights[:, None]).astype(np.float32)
-    meta = {
-        "decomposition_method": "HR-AdaVMD",
-        "hr_adavmd_components": [
-            "physiology_guided_frequency_initialization",
-            "heart_band_mode_scoring",
-            "adaptive_mode_weighting",
-        ],
-        "hr_adavmd_init_omega": [float(x) for x in init_omega.tolist()],
-        "hr_adavmd_init_center_hz": [float(x * sampling_rate_hz) for x in init_omega.tolist()],
-        **score_meta,
-        "selected_mode_count": int(k),
-    }
-    return weighted_modes, meta
-
-
-def frequency_features(
-    modes: np.ndarray,
-    sampling_rate_hz: float = DEFAULT_SAMPLING_RATE_HZ,
-) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
-    time_modes = np.asarray(modes, dtype=np.float32)
-    if time_modes.ndim == 1:
-        time_modes = time_modes[None, :]
-    n = int(time_modes.shape[-1])
-    if n == 0:
-        return (
-            np.empty((*time_modes.shape[:-1], 0), dtype=np.float32),
-            np.empty((0,), dtype=np.float32),
-            {
-                "frequency_feature": "hann_rfft_log_magnitude",
-                "sampling_rate_hz": float(sampling_rate_hz),
-                "frequency_bins": 0,
-                "frequency_resolution_hz": None,
-            },
-        )
-
-    window = np.hanning(n).astype(np.float32)
-    spectrum = np.fft.rfft(time_modes * window[None, :], axis=-1)
-    x_freq = np.log1p(np.abs(spectrum)).astype(np.float32)
-    x_freq = np.stack([zscore_1d(row) for row in x_freq], axis=0).astype(np.float32)
-    freq_hz = np.fft.rfftfreq(n, d=1.0 / float(sampling_rate_hz)).astype(np.float32)
-    meta = {
-        "frequency_feature": "hann_rfft_log_magnitude",
-        "sampling_rate_hz": float(sampling_rate_hz),
-        "frequency_bins": int(freq_hz.size),
-        "frequency_resolution_hz": float(freq_hz[1] - freq_hz[0]) if freq_hz.size > 1 else None,
-        "frequency_range_hz": [float(freq_hz[0]), float(freq_hz[-1])] if freq_hz.size else [],
-    }
-    return x_freq, freq_hz, meta
-
-
-def rda_log_magnitude(radar: np.ndarray) -> np.ndarray:
-    return np.log1p(np.abs(radar)).astype(np.float32)
+# Feature extraction is implemented in src.features.representations.
 
 
 def normalize_features(x: np.ndarray, mode: str) -> np.ndarray:
@@ -1207,6 +804,42 @@ def build_frame_times(time: np.ndarray, n_frames: int) -> np.ndarray:
     return np.arange(n_frames, dtype=np.float32)
 
 
+def dataset_frame_times(dataset: str, ref_time: np.ndarray, n_frames: int) -> np.ndarray:
+    """Assign native radar times; reference endpoints do not set radar duration."""
+    if dataset == "PhysDrive":
+        return build_frame_times(ref_time, n_frames)
+    return np.arange(n_frames, dtype=np.float32) / SOURCE_SAMPLING_RATE_HZ[dataset]
+
+
+def native_window_geometry(dataset: str, window_size: int, stride: int) -> Tuple[int, int]:
+    ratio = SOURCE_SAMPLING_RATE_HZ[dataset] / DEFAULT_SAMPLING_RATE_HZ
+    native_size = window_size * ratio
+    native_stride = stride * ratio
+    if not native_size.is_integer() or not native_stride.is_integer():
+        raise ValueError(f"{dataset}: window-size and stride must map to whole native frames")
+    return int(native_size), int(native_stride)
+
+
+def radar_window_at_target_rate(radar_window: np.ndarray, dataset: str, target_size: int) -> np.ndarray:
+    if dataset != "BGT60TR13C":
+        return radar_window
+    result = resample_poly(radar_window, up=2, down=3, axis=0)
+    if result.shape[0] != target_size:
+        raise ValueError(f"BGT resampling produced {result.shape[0]} frames, expected {target_size}")
+    return result.astype(np.complex64, copy=False)
+
+
+def label_window_at_target_rate(values: np.ndarray, dataset: str, target_size: int) -> np.ndarray:
+    if dataset != "BGT60TR13C":
+        return np.asarray(values, dtype=np.float32)
+    target_positions = np.arange(target_size, dtype=np.float32) * np.float32(1.5)
+    return np.interp(
+        target_positions,
+        np.arange(len(values), dtype=np.float32),
+        np.asarray(values, dtype=np.float32),
+    ).astype(np.float32)
+
+
 def interpolate_label_to_frames(
     label: np.ndarray,
     ref_time: np.ndarray,
@@ -1219,6 +852,9 @@ def interpolate_label_to_frames(
         return np.full(frame_time.shape, np.nan, dtype=np.float32)
     y = y[:n]
     t = t[:n]
+    # 已逐帧对齐的标签不能重插值，否则 NeuroKit 标记的 NaN 缺口会被填平。
+    if n == frame_time.size and np.array_equal(t, frame_time):
+        return y.copy()
     valid = np.isfinite(y) & np.isfinite(t)
     if int(valid.sum()) == 0:
         return np.full(frame_time.shape, np.nan, dtype=np.float32)
@@ -1310,12 +946,33 @@ def build_training_dataset(args: argparse.Namespace) -> None:
 
     print_stage("Stage 1/4: collect exported samples")
     samples = collect_exported_samples(exports_dir, args.datasets)
+    ftu_frontend_fingerprints = {
+        sample["source_row"].get("ftu_adc_frontend_fingerprint", "").strip()
+        for sample in samples if sample["dataset"] == "FTU"
+    }
+    if len(ftu_frontend_fingerprints) > 1:
+        raise ValueError(
+            "FTU source manifest mixes ADC frontends; build each frontend into a separate export"
+        )
+    ftu_frontend_fingerprint = next(iter(ftu_frontend_fingerprints), "") or "unversioned"
+    ftu_alias_audit_hashes = {
+        sample["source_row"].get("ftu_alias_audit_sha256", "").strip()
+        for sample in samples if sample["dataset"] == "FTU"
+    }
+    if len(ftu_alias_audit_hashes) > 1:
+        raise ValueError("FTU source manifest mixes physical-alias audit versions")
+    ftu_alias_audit_sha256 = next(iter(ftu_alias_audit_hashes), "") or "unversioned"
     bgt_long_participants = collect_bgt_long_participants(samples)
     print(f"[builder] collected {len(samples)} exported sample(s)", flush=True)
     group_label_means: Dict[str, float] = {}
     if args.split_mode == "balanced_grouped":
-        print_stage("Stage 1/4: scan group label means for balanced split")
-        group_label_means = compute_group_label_means(samples, show_progress=True)
+        print_stage("Stage 1/4: scan non-FTU group label means for balanced split")
+        # FTU assignment is frozen. Reading its val/test labels to compute a
+        # split score would be unnecessary and would weaken the sealed protocol.
+        group_label_means = compute_group_label_means(
+            [sample for sample in samples if sample["dataset"] != "FTU"],
+            show_progress=True,
+        )
     domain_split_map = build_domain_split_map(
         samples=samples,
         ratios=split_ratios,
@@ -1360,6 +1017,8 @@ def build_training_dataset(args: argparse.Namespace) -> None:
         sample_key = f"{dataset}/{sample_tag}"
         group_key = get_group_key(sample)
         split = domain_split_map[group_key]
+        if args.only_splits is not None and split not in args.only_splits:
+            continue
         if group_key not in summary["groups_by_dataset_split"][dataset][split]:
             summary["groups_by_dataset_split"][dataset][split].append(group_key)
         npz_path = Path(sample["npz_path"])
@@ -1368,17 +1027,24 @@ def build_training_dataset(args: argparse.Namespace) -> None:
             data = np.load(npz_path, allow_pickle=False)
             radar = data["radar"]
             ref_time = data["time"]
-            frame_time = build_frame_times(ref_time, int(radar.shape[0]))
-            frame_labels = {
-                "heart_rate": interpolate_label_to_frames(
-                    data["heart_rate"], ref_time, frame_time
-                ),
-            }
+            heart_rate = data["heart_rate"]
         except Exception as exc:  # noqa: BLE001
             print_progress(sample_idx, len(samples), f"skip {sample_key}: {exc}")
             continue
+        if dataset == "PhysDrive" and (
+            radar.shape[0] != len(ref_time)
+            or radar.shape[0] != len(heart_rate)
+        ):
+            raise ValueError(f"{sample_key}: 逐帧雷达、时间与心率长度不一致；请重新导出")
+        frame_time = dataset_frame_times(dataset, ref_time, int(radar.shape[0]))
+        frame_labels = {
+            "heart_rate": interpolate_label_to_frames(heart_rate, ref_time, frame_time),
+        }
 
-        starts = iter_window_starts(int(radar.shape[0]), args.window_size, args.stride)
+        native_window_size, native_stride = native_window_geometry(
+            dataset, args.window_size, args.stride
+        )
+        starts = iter_window_starts(int(radar.shape[0]), native_window_size, native_stride)
         if not starts:
             summary["windows_skipped_short"] += 1
             print_progress(sample_idx, len(samples), f"short sample {sample_key}")
@@ -1393,7 +1059,7 @@ def build_training_dataset(args: argparse.Namespace) -> None:
         )
 
         for window_idx, start in enumerate(starts):
-            end = start + args.window_size
+            end = start + native_window_size
             labels: Dict[str, float] = {}
             coverage: Dict[str, float] = {}
             keep = True
@@ -1411,8 +1077,15 @@ def build_training_dataset(args: argparse.Namespace) -> None:
                 dataset_summary["windows_skipped_label"] += 1
                 continue
 
-            radar_window = radar[start:end]
-            feature_bundle = radar_to_feature_bundle(radar_window, args.representation)
+            radar_window = radar_window_at_target_rate(
+                radar[start:end], dataset, args.window_size
+            )
+            feature_bundle = radar_to_feature_bundle(
+                radar_window, args.representation,
+                hr_band_hz=SOURCE_HR_BAND_HZ[dataset],
+                vmd_init_profile=SOURCE_VMD_INIT_PROFILE[dataset],
+                include_rda=not args.drop_rda,
+            )
             feature_bundle["x"] = normalize_features(feature_bundle["x"], args.normalize)
             if "x_time" in feature_bundle:
                 feature_bundle["x_time"] = normalize_features(feature_bundle["x_time"], args.normalize)
@@ -1436,11 +1109,23 @@ def build_training_dataset(args: argparse.Namespace) -> None:
                 "sample_tag": sample_tag,
                 "group_key": group_key,
                 "source_npz_path": str(npz_path),
+                "ftu_adc_frontend_fingerprint": (
+                    ftu_frontend_fingerprint if dataset == "FTU" else None
+                ),
+                "ftu_alias_audit_sha256": (
+                    ftu_alias_audit_sha256 if dataset == "FTU" else None
+                ),
                 "domain_split": split,
                 "window_start": int(start),
                 "window_end": int(end),
                 "window_size": int(args.window_size),
                 "stride": int(args.stride),
+                "source_window_size": native_window_size,
+                "source_stride": native_stride,
+                "source_sampling_rate_hz": SOURCE_SAMPLING_RATE_HZ[dataset],
+                "sampling_rate_hz": DEFAULT_SAMPLING_RATE_HZ,
+                "window_start_time_seconds": float(frame_time[start]),
+                "resampling": "polyphase_2_3" if dataset == "BGT60TR13C" else "none",
                 "representation": args.representation,
                 "normalize": args.normalize,
                 "label_reduction": args.label_reduction,
@@ -1452,7 +1137,9 @@ def build_training_dataset(args: argparse.Namespace) -> None:
                 feature_bundle=feature_bundle,
                 labels=labels,
                 label_series={
-                    "heart_rate": frame_labels["heart_rate"][start:end],
+                    "heart_rate": label_window_at_target_rate(
+                        frame_labels["heart_rate"][start:end], dataset, args.window_size
+                    ),
                 },
                 meta=meta,
             )
@@ -1495,6 +1182,12 @@ def build_training_dataset(args: argparse.Namespace) -> None:
             "exports_dir": str(exports_dir),
             "output_dir": str(output_dir),
             "datasets": list(args.datasets),
+            "diagnostic_only": bool(getattr(args, "diagnostic_only", False)),
+            "only_splits": list(args.only_splits) if args.only_splits is not None else None,
+            "source_gate_pass": False,
+            "drop_rda": bool(args.drop_rda),
+            "ftu_adc_frontend_fingerprint": ftu_frontend_fingerprint,
+            "ftu_alias_audit_sha256": ftu_alias_audit_sha256,
             "window_size": args.window_size,
             "stride": args.stride,
             "representation": args.representation,
@@ -1512,28 +1205,41 @@ def build_training_dataset(args: argparse.Namespace) -> None:
                 "hr_band_peak": 0.25,
                 "spatial_consistency": 0.15,
             },
-            "hr_band_hz": list(DEFAULT_HR_BAND_HZ),
+            "hr_band_hz_by_dataset": {
+                dataset: list(SOURCE_HR_BAND_HZ[dataset]) for dataset in args.datasets
+            },
+            "vmd_init_profile_by_dataset": {
+                dataset: SOURCE_VMD_INIT_PROFILE[dataset] for dataset in args.datasets
+            },
             "rda_stability_segments": DEFAULT_RDA_STABILITY_SEGMENTS,
             "vmd_k": DEFAULT_VMD_K,
+            "decomposition_algorithm_version": DECOMPOSITION_ALGORITHM_VERSION,
             "vmd_alpha": DEFAULT_VMD_ALPHA,
             "vmd_max_iter": DEFAULT_VMD_MAX_ITER,
             "vmd_tol": DEFAULT_VMD_TOL,
-            "hr_band_hz": list(DEFAULT_HR_BAND_HZ),
             "resp_band_hz": list(DEFAULT_RESP_BAND_HZ),
             "sampling_rate_hz": DEFAULT_SAMPLING_RATE_HZ,
+            "source_sampling_rate_hz_by_dataset": SOURCE_SAMPLING_RATE_HZ,
+            "bgt60_resampling": "window_polyphase_2_3_complex_rda",
             "x_rda_representation": DEFAULT_RDA_REPRESENTATION,
-            "output_arrays": ["x", "x_time", "x_freq", "x_rda", "freq_hz"],
+            "output_arrays": (["x", "x_time", "x_freq", "freq_hz"]
+                              if args.drop_rda else ["x", "x_time", "x_freq", "x_rda", "freq_hz"]),
             "method_pipeline": list(METHOD_PIPELINE),
             "innovation_modules": list(INNOVATION_MODULES),
             "domain_adaptation_method": DOMAIN_ADAPTATION_METHOD,
             "split_mode": args.split_mode,
+            "fixed_participant_splits": {
+                dataset: {split: list(participants)
+                          for split, participants in DEFAULT_PARTICIPANT_SPLITS[dataset].items()}
+                for dataset in args.datasets if dataset in DEFAULT_PARTICIPANT_SPLITS
+            },
             "grouping": {
                 "FTU": "participant_id",
                 "BGT60TR13C": "participant_id",
                 "PhysDrive": "session_id",
             },
             "ftu_special_case_policy": {
-                "mode": "soft_balance_across_splits",
+                "mode": "fixed_ftu_participant_protocol_v2",
                 "special_participants": list(FTU_SPECIAL_PARTICIPANTS),
                 "special_participants_note": {
                     "2": "experienced meditator",
@@ -1541,11 +1247,7 @@ def build_training_dataset(args: argparse.Namespace) -> None:
                     "6": "asthma",
                 },
                 "elevated_hr_participants": list(FTU_ELEVATED_HR_PARTICIPANTS),
-                "rule": (
-                    "Keep participant groups intact; softly prefer placing at least one "
-                    "known special participant in each of train/val/test when feasible, "
-                    "while balancing HR label means."
-                ),
+                "rule": "Use the frozen FTU participant assignment above; keep all records of a participant in the same split.",
             },
             "bgt_long_split": DEFAULT_BGT_LONG_SPLIT,
             "bgt_long_participants": sorted(bgt_long_participants),

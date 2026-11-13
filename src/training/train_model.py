@@ -31,6 +31,7 @@ from src.models.factory import (
 )
 from src.training.common.metrics import aggregate, append_prediction_rows, mae_bpm, rmse_bpm, tolerance_metrics
 from src.training.datasets import LabelStats, build_datasets
+from src.training.export_gate import validate_export_version
 
 
 def parse_args() -> argparse.Namespace:
@@ -46,7 +47,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--datasets",
         nargs="+",
-        default=None,
+        default=["FTU"],
         choices=["FTU", "BGT60TR13C", "PhysDrive"],
         help="Optional dataset subset, for example: --datasets FTU",
     )
@@ -132,6 +133,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--down-sampling-layers", type=int, default=3)
     parser.add_argument("--time-only", action="store_true", help="Disable the frequency branch.")
     parser.add_argument("--limit-batches", type=int, default=None, help="Debug only: cap batches per epoch.")
+    parser.add_argument(
+        "--evaluate-test", action="store_true",
+        help="Evaluate sealed test windows only after the method is frozen.",
+    )
+    parser.add_argument(
+        "--allow-legacy-representation", action="store_true",
+        help="Explicitly allow old proposed windows without the corrected decomposition version.",
+    )
     return parser.parse_args()
 
 
@@ -329,12 +338,15 @@ def save_checkpoint(
 
 def main() -> None:
     args = parse_args()
+    validate_export_version(args.export_dir, args.allow_legacy_representation,
+                            datasets=set(args.datasets))
     seed_everything(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     dataset_filter = set(args.datasets) if args.datasets else None
-    train_ds, val_ds, test_ds, stats = build_datasets(args.export_dir, datasets=dataset_filter)
+    train_ds, val_ds, test_ds, stats = build_datasets(
+        args.export_dir, datasets=dataset_filter, include_test=args.evaluate_test)
     loader_kwargs = {
         "batch_size": args.batch_size,
         "num_workers": args.num_workers,
@@ -342,7 +354,10 @@ def main() -> None:
     }
     train_loader = DataLoader(train_ds, shuffle=True, drop_last=False, **loader_kwargs)
     val_loader = DataLoader(val_ds, shuffle=False, drop_last=False, **loader_kwargs)
-    test_loader = DataLoader(test_ds, shuffle=False, drop_last=False, **loader_kwargs)
+    test_loader = (
+        DataLoader(test_ds, shuffle=False, drop_last=False, **loader_kwargs)
+        if test_ds is not None else None
+    )
 
     model, cfg = create_model_and_config(args)
     model = model.to(device)
@@ -356,7 +371,7 @@ def main() -> None:
         "label_stats": asdict(stats),
         "train_size": len(train_ds),
         "val_size": len(val_ds),
-        "test_size": len(test_ds),
+        "test_size": len(test_ds) if test_ds is not None else None,
         "datasets": sorted(dataset_filter) if dataset_filter else "all",
         "parameters": count_parameters(model),
         "device": str(device),
@@ -406,22 +421,24 @@ def main() -> None:
 
     checkpoint = torch.load(args.output_dir / "best.pt", map_location=device, weights_only=False)
     model.load_state_dict(checkpoint["model_state"])
-    test_metrics = run_epoch(
-        model,
-        test_loader,
-        criterion,
-        device,
-        stats,
-        limit_batches=args.limit_batches,
-        collect_participant_metrics=True,
+    test_metrics = None
+    if test_loader is not None:
+        test_metrics = run_epoch(
+            model, test_loader, criterion, device, stats,
+            limit_batches=args.limit_batches, collect_participant_metrics=True,
+        )
+    save_checkpoint(
+        args.output_dir / "final.pt", model, cfg, stats,
+        test_metrics if test_metrics is not None else checkpoint["metrics"],
+        int(checkpoint["epoch"]),
     )
-    save_checkpoint(args.output_dir / "final.pt", model, cfg, stats, test_metrics, int(checkpoint["epoch"]))
     summary = {"best_val_mae_bpm": best_val, "test": test_metrics, "elapsed_sec": time.time() - start}
     (args.output_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     # Per the experiment results-spec, also emit a standalone eval artifact.
-    (args.output_dir / "eval_test.json").write_text(
-        json.dumps(test_metrics, indent=2), encoding="utf-8"
-    )
+    if test_metrics is not None:
+        (args.output_dir / "eval_test.json").write_text(
+            json.dumps(test_metrics, indent=2), encoding="utf-8"
+        )
     print(json.dumps(summary, indent=2), flush=True)
 
 

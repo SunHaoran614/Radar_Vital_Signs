@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "radar-vital-signs"
+version = "0.1.0"
+description = "Radar signal processing, heart-rate regression and source-free adaptation"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "scipy",
+    "pandas>=2",
+    "matplotlib",
+    "scikit-learn",
+    "h5py",
+    "pyyaml",
+    "neurokit2",
+    "torch",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-subtests", "ruff"]
+
+[project.scripts]
+radar-infer = "src.inference.dar_pipeline:main"
+radar-train = "src.training.train_model:main"
+radar-evaluate = "src.training.evaluate_model:main"
+radar-adapt = "src.training.adapt_source_free:main"
+radar-build-windows = "src.data.build_training_dataset:main"
+radar-export = "src.data.loaders.export_all_datasets:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src", "src.*"]
+exclude = ["historical_archive", "historical_archive.*", "tests", "tests.*"]
+
+[tool.setuptools]
+include-package-data = false

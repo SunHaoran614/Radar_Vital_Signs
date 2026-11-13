@@ -1,11 +1,2 @@
-pip
-matplotlib
-pandas==2.2.3
-matplotlib
-scipy
-scikit-learn
-h5py
-pyyaml
-ruff
-neurokit2
-torch
+# Install the maintained runtime package and its dependencies.
+-e .

@@ -5,12 +5,12 @@
 2. 批量加载三种数据集
 3. 保存到指定输出目录
 
-示例：
-python src/data/loaders/export_all_datasets.py \
+示例（从仓库根目录运行）：
+python -m src.data.loaders.export_all_datasets \
   --ftu
 
 默认运行（所有参数使用 default）：
-python src/data/loaders/export_all_datasets.py
+python -m src.data.loaders.export_all_datasets
 
 可在文件头部修改全局变量（例如 FTU_PARTICIPANT_ID / FTU_SCENARIO / FTU_DISTANCE）来筛选数据。
 """
@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -27,13 +29,10 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 
-from pathlib import Path
-import sys
-
-
-from .bgt60_loader import BGT60TR13CDataLoader
 from .ftu_loader import FTUDataLoader
-from .physdrive_loader import PhysDriveDataLoader
+from src.radar.ftu_adc_config import FTUADCConfig
+from src.radar.bgt_adc_config import BGTADCConfig
+from src.data.ftu_uniqueness import alias_map
 
 # PROJECT_ROOT = Path(__file__).resolve().parents[3]
 # if str(PROJECT_ROOT) not in sys.path:
@@ -51,8 +50,8 @@ if str(ROOT) not in sys.path:
 
 # ==================== Global Config (Manual Edit) ====================
 # 数据路径与输出路径
-DATASET_ROOT = Path("V:/")
-OUTPUT_DIR = ROOT / "exports"
+DATASET_ROOT = Path(os.environ.get("RADAR_DATA_ROOT", "data"))
+OUTPUT_DIR = Path("exports")
 
 # 导出控制
 COMPRESS_OUTPUT = True
@@ -105,16 +104,43 @@ def parse_args() -> argparse.Namespace:
         help="仅导出 FTU(若与其它数据集参数同时出现,则按出现的数据集导出)",
     )
     parser.add_argument(
+        "--ftu-frontend-config",
+        type=Path,
+        default=None,
+        help="FTU ADC→RDA 前端 JSON 配置；默认保持旧版前端。",
+    )
+    parser.add_argument(
+        "--ftu-alias-audit",
+        type=Path,
+        default=None,
+        help="用户提供的FTU全字节去别名清单；配置FTU ADC前端时必须显式提供。",
+    )
+    parser.add_argument(
         "--bgt60",
         action="store_true",
         help="仅导出 BGT60(若与其它数据集参数同时出现,则按出现的数据集导出)",
+    )
+    parser.add_argument(
+        "--bgt-frontend-config",
+        type=Path,
+        default=None,
+        help="BGT ADC→RDA 候选前端 JSON 配置；不指定则保持旧版数值转换。",
+    )
+    parser.add_argument(
+        "--bgt-skip-long",
+        action="store_true",
+        help="BGT 版本化导出时暂不处理两小时长录制。",
     )
     parser.add_argument(
         "--physdrive",
         action="store_true",
         help="仅导出 PhysDrive(若与其它数据集参数同时出现,则按出现的数据集导出)",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    includes_ftu = args.ftu or not (args.physdrive or args.bgt60)
+    if includes_ftu and args.ftu_frontend_config is not None and args.ftu_alias_audit is None:
+        parser.error("--ftu-frontend-config requires --ftu-alias-audit")
+    return args
 
 
 def safe_name(text: str) -> str:
@@ -153,7 +179,9 @@ def write_manifest(path: Path, rows: Iterable[Dict[str, Any]]) -> None:
             f.write("")
         return
 
-    headers = list(rows[0].keys())
+    # A failed sample and a successful sample have different diagnostic fields.
+    # Keep first-seen column order while accepting either row order.
+    headers = list(dict.fromkeys(key for row in rows for key in row))
     with path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=headers)
         writer.writeheader()
@@ -434,9 +462,11 @@ def _neurokit_rsp_rate(
 def build_physdrive_reference(ref: Dict[str, Any], frame_rate_hz: float) -> Dict[str, np.ndarray]:
     ecg = np.asarray(ref["ecg"], dtype=np.float32).reshape(-1)
     resp = np.asarray(ref["respiration"], dtype=np.float32).reshape(-1)
-    n = min(ecg.size, resp.size)
-    ecg = ecg[:n]
-    resp = resp[:n]
+    if ecg.size != resp.size or ecg.size == 0:
+        raise ValueError(
+            f"PhysDrive ECG/RESP 长度不一致或为空: ecg={ecg.size}, resp={resp.size}"
+        )
+    n = ecg.size
     time = np.arange(n, dtype=np.float32) / np.float32(frame_rate_hz)
 
     heart_rate = _clean_rate(
@@ -531,16 +561,31 @@ def _build_rda_cube_from_frame(
     sample_idx: np.ndarray,
     target_doppler: int,
     target_angle: int,
+    doppler_method: str = "legacy_truncate",
+    clutter_method: str = "chirp_mean",
 ) -> np.ndarray:
     """将单帧原始 (rx,chirps,samples) 转为 (doppler,angle,range_full)。"""
     frame = np.asarray(frame_data, dtype=np.complex64)[:, chirp_idx][:, :, sample_idx]  # (rx,c,s)
-    frame = frame - frame.mean(axis=1, keepdims=True)  # slow-time clutter suppression
+    if clutter_method == "chirp_mean":
+        frame = frame - frame.mean(axis=1, keepdims=True)
+    elif clutter_method != "none":
+        raise ValueError(f"Unknown clutter_method: {clutter_method}")
     range_fft = np.fft.fft(frame, axis=-1)
     range_fft = range_fft[..., : max(1, range_fft.shape[-1] // 2)]  # positive range half
-    doppler_fft = np.fft.fftshift(
-        np.fft.fft(range_fft, n=target_doppler, axis=1),
-        axes=1,
-    )  # (rx,d,r)
+    if doppler_method == "legacy_truncate":
+        # Historical behavior: n < chirps silently truncates to the first n chirps.
+        doppler_fft = np.fft.fftshift(
+            np.fft.fft(range_fft, n=target_doppler, axis=1), axes=1
+        )
+    elif doppler_method == "full_center_bins":
+        full = np.fft.fftshift(np.fft.fft(range_fft, axis=1), axes=1)
+        center = full.shape[1] // 2
+        start = center - target_doppler // 2
+        doppler_fft = full[:, start:start + target_doppler, :]
+        if doppler_fft.shape[1] != target_doppler:
+            raise ValueError("target_doppler exceeds selected chirp count")
+    else:
+        raise ValueError(f"Unknown doppler_method: {doppler_method}")
     angle_fft = np.fft.fftshift(
         np.fft.fft(doppler_fft, n=target_angle, axis=0),
         axes=0,
@@ -553,10 +598,17 @@ def convert_adc_cube_to_rda(
     target_doppler: int = TARGET_DOPPLER,
     target_angle: int = TARGET_ANGLE,
     target_range: int = TARGET_RANGE,
+    doppler_method: str = "legacy_truncate",
+    clutter_method: str = "chirp_mean",
+    chirp_selection_method: str = "legacy_64",
+    range_selection_method: str = "global_energy",
+    range_search_bins: Optional[Tuple[int, int]] = None,
 ) -> Tuple[np.ndarray, np.ndarray, int]:
     """将 (frames, rx, chirps, samples) 转为 (frames, doppler, angle, range)。
 
-    与旧版不同：range 维采用“全样本统一目标窗口”，而非逐帧 top-k。
+    range 维采用全样本统一目标窗口，而非逐帧 top-k。默认参数保持
+    旧版导出行为；显式的 all/full_center_bins/none/motion_zero_doppler
+    组合用于尚未晋级正式导出的物理候选实验。
     返回:
         - rda: (frames, target_doppler, target_angle, target_range)
         - selected_range_bins: 连续窗口对应的原始 range bin 索引
@@ -568,11 +620,24 @@ def convert_adc_cube_to_rda(
     frames, _, chirps, samples = radar.shape
     out = np.empty((frames, target_doppler, target_angle, target_range), dtype=np.complex64)
 
-    chirp_idx = _select_even_indices(chirps, min(chirps, 64))
+    if chirp_selection_method == "legacy_64":
+        chirp_idx = _select_even_indices(chirps, min(chirps, 64))
+    elif chirp_selection_method == "all":
+        chirp_idx = np.arange(chirps, dtype=np.int32)
+    else:
+        raise ValueError(f"Unknown chirp_selection_method: {chirp_selection_method}")
+    if range_selection_method not in {"global_energy", "motion_zero_doppler"}:
+        raise ValueError(f"Unknown range_selection_method: {range_selection_method}")
+    if range_selection_method == "motion_zero_doppler" and (
+        doppler_method != "full_center_bins" or clutter_method != "none"
+    ):
+        raise ValueError("motion_zero_doppler requires full_center_bins and no chirp-mean clutter removal")
     sample_idx = _select_even_indices(samples, min(samples, 256))
 
     # pass-1: 全样本估计目标中心 range bin（语义稳定）
     global_range_energy: Optional[np.ndarray] = None
+    zero_sum: Optional[np.ndarray] = None
+    zero_power: Optional[np.ndarray] = None
     for fi in range(frames):
         cube_full = _build_rda_cube_from_frame(
             frame_data=radar[fi],
@@ -580,17 +645,39 @@ def convert_adc_cube_to_rda(
             sample_idx=sample_idx,
             target_doppler=target_doppler,
             target_angle=target_angle,
+            doppler_method=doppler_method,
+            clutter_method=clutter_method,
         )  # (d,a,rfull)
-        energy = np.mean(np.abs(cube_full), axis=(0, 1))
-        if global_range_energy is None:
-            global_range_energy = energy.astype(np.float64)
+        if range_selection_method == "global_energy":
+            energy = np.mean(np.abs(cube_full), axis=(0, 1))
+            if global_range_energy is None:
+                global_range_energy = energy.astype(np.float64)
+            else:
+                global_range_energy += energy
         else:
-            global_range_energy += energy
+            # Preserve complex slow-time motion in the zero-Doppler slice.
+            zero = np.asarray(cube_full[target_doppler // 2], dtype=np.complex128)
+            if zero_sum is None:
+                zero_sum = np.zeros_like(zero, dtype=np.complex128)
+                zero_power = np.zeros_like(zero.real, dtype=np.float64)
+            zero_sum += zero
+            zero_power += np.abs(zero) ** 2
 
+    if range_selection_method == "motion_zero_doppler" and zero_sum is not None:
+        variance = zero_power / frames - np.abs(zero_sum / frames) ** 2
+        global_range_energy = np.mean(np.maximum(variance, 0), axis=0)
     if global_range_energy is None or global_range_energy.size == 0:
         raise ValueError("无法估计 range 能量分布。")
 
-    center_range_bin = int(np.argmax(global_range_energy))
+    if range_search_bins is None and range_selection_method == "motion_zero_doppler":
+        range_search_bins = (8, min(46, len(global_range_energy)))
+    if range_search_bins is not None:
+        lo, hi = map(int, range_search_bins)
+        if not (0 <= lo < hi <= len(global_range_energy)):
+            raise ValueError("Invalid range_search_bins")
+        center_range_bin = lo + int(np.argmax(global_range_energy[lo:hi]))
+    else:
+        center_range_bin = int(np.argmax(global_range_energy))
     selected_range_bins = _range_window_indices(
         total_bins=int(global_range_energy.size),
         target_bins=target_range,
@@ -605,6 +692,8 @@ def convert_adc_cube_to_rda(
             sample_idx=sample_idx,
             target_doppler=target_doppler,
             target_angle=target_angle,
+            doppler_method=doppler_method,
+            clutter_method=clutter_method,
         )  # (d,a,rfull)
         cube = cube_full[:, :, selected_range_bins]
         out[fi] = _crop_or_pad_last_axis(cube, target_range).astype(np.complex64)
@@ -618,15 +707,26 @@ def align_rda_shape(
     target_angle: int = TARGET_ANGLE,
     target_range: int = TARGET_RANGE,
 ) -> np.ndarray:
-    """将现有 RDA 数据对齐到统一的 (frames, d, a, r) 尺寸。"""
+    """Align an *already spectral* RDA cube without another Doppler/angle FFT."""
     if radar_rda.ndim != 4:
         raise ValueError(f"期望 PhysDrive RDA 为 4D，实际 ndim={radar_rda.ndim}")
     x = np.asarray(radar_rda, dtype=np.complex64)
-    # 通过 FFT/截断对齐 doppler 与 angle
-    if x.shape[1] != target_doppler:
-        x = np.fft.fftshift(np.fft.fft(x, n=target_doppler, axis=1), axes=1)
-    if x.shape[2] != target_angle:
-        x = np.fft.fftshift(np.fft.fft(x, n=target_angle, axis=2), axes=2)
+    # Doppler and angle are frequency-bin axes here. Transforming them again
+    # changes their meaning, and np.fft.fft(..., n=smaller) also drops bins.
+    for axis, target in ((1, target_doppler), (2, target_angle)):
+        source = x.shape[axis]
+        if source == target:
+            continue
+        if source > target:
+            lo = (source - target) // 2
+            selection = [slice(None)] * x.ndim
+            selection[axis] = slice(lo, lo + target)
+            x = x[tuple(selection)]
+        else:
+            before = (target - source) // 2
+            padding = [(0, 0)] * x.ndim
+            padding[axis] = (before, target - source - before)
+            x = np.pad(x, padding)
     if x.shape[3] != target_range:
         x = _crop_or_pad_last_axis(x, target_range)
     return x.astype(np.complex64)
@@ -639,10 +739,21 @@ def export_ftu(
     participant_id: Optional[int] = None,
     scenario: Optional[str] = None,
     distance: Optional[str] = None,
+    frontend_config: Optional[FTUADCConfig] = None,
+    alias_audit: Optional[Path] = None,
+    participant_ids: Optional[set[int]] = None,
+    resume: bool = False,
 ) -> Tuple[int, int]:
     started_at = time.monotonic()
     print_stage("FTU", "Stage 1/4: initialize loader")
-    loader = FTUDataLoader(str(dataset_root / "4TU.ResearchD"))
+    ftu_roots = (dataset_root, dataset_root / "4TU", dataset_root / "4TU.ResearchD")
+    ftu_root = next((path for path in ftu_roots
+                     if all((path / part).is_dir() for part in
+                            ("Radar data", "HR_Ref_Values", "BR_Ref_Values"))), None)
+    if ftu_root is None:
+        raise FileNotFoundError(f"FTU dataset not found under {dataset_root}")
+    loader = FTUDataLoader(str(ftu_root))
+    frontend_config = frontend_config or FTUADCConfig()
     dataset_out = output_dir / "FTU"
     manifest_rows: List[Dict[str, Any]] = []
 
@@ -652,8 +763,22 @@ def export_ftu(
         scenario=scenario,
         limit=None
     )
+    if participant_ids is not None:
+        if participant_id is not None:
+            raise ValueError("participant_id and participant_ids cannot be combined")
+        samples = [sample for sample in samples if sample["participant_id"] in participant_ids]
     if distance is not None:
         samples = [s for s in samples if s["distance"] == distance]
+    alias_audit_sha256 = None
+    if alias_audit is not None:
+        aliases = alias_map(alias_audit)
+        alias_audit_sha256 = hashlib.sha256(alias_audit.read_bytes()).hexdigest()
+        samples = [sample for sample in samples if (
+            tag := f"p{sample['participant_id']:02d}_{safe_name(sample['scenario'])}_"
+                   f"{safe_name(sample['distance'])}_r{sample['repeat']}")
+            == aliases.get(tag, tag)]
+        if participant_ids is None and participant_id is None and scenario is None and distance is None and len(samples) != 376:
+            raise ValueError(f"Expected 376 unique FTU recordings, found {len(samples)}")
 
     if not samples:
         print("[FTU] 没有匹配样本，跳过导出。")
@@ -673,13 +798,61 @@ def export_ftu(
             f"p{pid:02d}_{safe_name(scenario)}_{safe_name(distance)}_r{repeat}"
         )
 
+        npz_path = dataset_out / "samples" / f"{sample_tag}.npz"
+        meta_path = dataset_out / "meta" / f"{sample_tag}.json"
+        if resume and npz_path.is_file() and meta_path.is_file():
+            try:
+                with meta_path.open(encoding="utf-8") as handle:
+                    saved_meta = json.load(handle)
+                if saved_meta.get("ftu_adc_frontend_fingerprint") != frontend_config.fingerprint:
+                    raise ValueError("saved ADC frontend fingerprint mismatch")
+                if saved_meta.get("ftu_alias_audit_sha256") != alias_audit_sha256:
+                    raise ValueError("saved alias audit hash mismatch")
+                with np.load(npz_path, allow_pickle=False) as saved:
+                    saved_radar = saved["radar"]
+                    saved_time = saved["time"]
+                    saved_hr = saved["heart_rate"]
+                    if (list(saved_radar.shape) != saved_meta["radar_shape"]
+                            or len(saved_time) != saved_meta["reference_len"]
+                            or len(saved_hr) != len(saved_time)
+                            or not np.all(np.isfinite(saved_radar))
+                            or not np.all(np.isfinite(saved_time))
+                            or not np.all(np.isfinite(saved_hr))):
+                        raise ValueError("saved numeric arrays are invalid")
+                manifest_rows.append({
+                    "sample_tag": sample_tag,
+                    "participant_id": pid,
+                    "scenario": scenario,
+                    "distance": distance,
+                    "repeat": repeat,
+                    "ftu_adc_frontend_fingerprint": frontend_config.fingerprint,
+                    "ftu_alias_audit_sha256": alias_audit_sha256 or "none",
+                    "npz_path": str(npz_path),
+                    "radar_shape": str(tuple(saved_meta["radar_shape"])),
+                    "reference_len": saved_meta["reference_len"],
+                    "status": "ok",
+                })
+                success += 1
+                print_sample_progress(
+                    dataset_name="FTU", current=i, total=len(samples),
+                    sample_tag=sample_tag, success=success, failure=failure,
+                    started_at=started_at, status="resume-verified",
+                )
+                continue
+            except Exception as exc:
+                print(f"[FTU] resume check failed for {sample_tag}; re-exporting: {exc}", flush=True)
+
         try:
-            radar = loader.load_radar_data(
-                participant_id=pid,
-                scenario=scenario,
-                distance=distance,
-                repeat=repeat,
-            )
+            if UNIFY_TO_RDA:
+                radar = loader.open_radar_frame_view(
+                    participant_id=pid, scenario=scenario,
+                    distance=distance, repeat=repeat,
+                )
+            else:
+                radar = loader.load_radar_data(
+                    participant_id=pid, scenario=scenario,
+                    distance=distance, repeat=repeat,
+                )
             ref = loader.load_reference_data(
                 participant_id=pid,
                 scenario=scenario,
@@ -690,7 +863,7 @@ def export_ftu(
             selected_range_bins: Optional[np.ndarray] = None
             center_range_bin: Optional[int] = None
             if UNIFY_TO_RDA:
-                radar_out, selected_range_bins, center_range_bin = convert_adc_cube_to_rda(radar)
+                radar_out, selected_range_bins, center_range_bin = frontend_config.convert(radar)
             else:
                 radar_out = radar
 
@@ -711,14 +884,18 @@ def export_ftu(
                     radar_out=radar_out,
                     radar_source=radar,
                     radar_preprocess="raw_iq_to_rda_fft" if UNIFY_TO_RDA else "none",
-                    range_selection_method=(
-                        "global_energy_center_contiguous_window" if UNIFY_TO_RDA else "none"
-                    ),
+                    range_selection_method=(frontend_config.range_selection_method
+                                            if UNIFY_TO_RDA else "none"),
                     range_center_bin=center_range_bin,
                     range_selected_bins=selected_range_bins,
                 ),
                 **build_common_reference_meta(unified_ref),
             }
+            if UNIFY_TO_RDA:
+                meta["ftu_adc_frontend_config"] = frontend_config.to_dict()
+                meta["ftu_adc_frontend_fingerprint"] = frontend_config.fingerprint
+            if alias_audit_sha256 is not None:
+                meta["ftu_alias_audit_sha256"] = alias_audit_sha256
             save_json(dataset_out / "meta" / f"{sample_tag}.json", meta)
 
             manifest_rows.append(
@@ -732,6 +909,10 @@ def export_ftu(
                         "scenario": scenario,
                         "distance": distance,
                         "repeat": repeat,
+                        "ftu_adc_frontend_fingerprint": (
+                            frontend_config.fingerprint if UNIFY_TO_RDA else "none"
+                        ),
+                        "ftu_alias_audit_sha256": alias_audit_sha256 or "none",
                     },
                 )
             )
@@ -747,6 +928,10 @@ def export_ftu(
                         "scenario": scenario,
                         "distance": distance,
                         "repeat": repeat,
+                        "ftu_adc_frontend_fingerprint": (
+                            frontend_config.fingerprint if UNIFY_TO_RDA else "none"
+                        ),
+                        "ftu_alias_audit_sha256": alias_audit_sha256 or "none",
                     },
                 )
             )
@@ -801,12 +986,21 @@ def export_bgt60(
     output_dir: Path,
     compress: bool,
     include_long: bool,
+    resume: bool = False,
+    frontend_config: FTUADCConfig | None = None,
 ) -> Tuple[int, int]:
     started_at = time.monotonic()
     print_stage("BGT60", "Stage 1/4: initialize loader")
+    from .bgt60_loader import BGT60TR13CDataLoader
+
     loader = BGT60TR13CDataLoader(str(dataset_root / "BGT60TR13C"))
+    frontend_config = frontend_config or FTUADCConfig()
     dataset_out = output_dir / "BGT60TR13C"
     manifest_rows: List[Dict[str, Any]] = []
+    existing_rows: Dict[str, Dict[str, Any]] = {}
+    if resume and (dataset_out / "manifest.csv").exists():
+        with (dataset_out / "manifest.csv").open(newline="", encoding="utf-8") as handle:
+            existing_rows = {row["sample_tag"]: row for row in csv.DictReader(handle)}
 
     print_stage("BGT60", "Stage 2/4: discover samples")
     samples = iter_bgt_samples(loader, include_long=include_long)
@@ -821,12 +1015,33 @@ def export_bgt60(
         measurement_type = sample["measurement_type"]
         sample_tag = f"p{pid:02d}_{safe_name(distance)}_{measurement_type}"
 
+        previous = existing_rows.get(sample_tag)
+        if previous is not None and previous.get("status") == "ok":
+            previous_path = Path(previous["npz_path"])
+            if previous_path.is_file() and (dataset_out / "meta" / f"{sample_tag}.json").is_file():
+                previous_meta = json.loads((dataset_out / "meta" / f"{sample_tag}.json").read_text())
+                previous_fingerprint = previous_meta.get("bgt_adc_frontend_fingerprint")
+                legacy_unversioned = (previous_fingerprint is None and
+                                      frontend_config == FTUADCConfig() and
+                                      previous_meta.get("range_selection_method") ==
+                                      "global_energy_center_contiguous_window")
+                if previous_fingerprint != frontend_config.fingerprint and not legacy_unversioned:
+                    raise ValueError(f"Cannot resume mixed BGT frontends: {sample_tag}")
+                manifest_rows.append(previous)
+                success += 1
+                print_sample_progress(
+                    "BGT60", i, len(samples), sample_tag, success, failure,
+                    started_at, "resumed",
+                )
+                continue
+
         try:
             radar = loader.load_radar_data(
                 participant_id=pid,
                 distance=distance if measurement_type == "short" else BGT_LONG_FIXED_DISTANCE,
                 measurement_type=measurement_type,
                 apply_dc_correction=False,
+                memory_map=(measurement_type == "long"),
             )
             ref = loader.load_reference_data(
                 participant_id=pid,
@@ -837,7 +1052,7 @@ def export_bgt60(
             selected_range_bins: Optional[np.ndarray] = None
             center_range_bin: Optional[int] = None
             if UNIFY_TO_RDA:
-                radar_out, selected_range_bins, center_range_bin = convert_adc_cube_to_rda(radar)
+                radar_out, selected_range_bins, center_range_bin = frontend_config.convert(radar)
             else:
                 radar_out = radar
 
@@ -858,12 +1073,14 @@ def export_bgt60(
                     radar_source=radar,
                     radar_preprocess="raw_adc_to_rda_fft" if UNIFY_TO_RDA else "none",
                     range_selection_method=(
-                        "global_energy_center_contiguous_window" if UNIFY_TO_RDA else "none"
+                        frontend_config.range_selection_method if UNIFY_TO_RDA else "none"
                     ),
                     range_center_bin=center_range_bin,
                     range_selected_bins=selected_range_bins,
                 ),
                 **build_common_reference_meta(unified_ref),
+                "bgt_adc_frontend_config": frontend_config.to_dict(),
+                "bgt_adc_frontend_fingerprint": frontend_config.fingerprint,
             }
             save_json(dataset_out / "meta" / f"{sample_tag}.json", meta)
 
@@ -877,6 +1094,7 @@ def export_bgt60(
                         "participant_id": pid,
                         "distance": distance,
                         "measurement_type": measurement_type,
+                        "bgt_adc_frontend_fingerprint": frontend_config.fingerprint,
                     },
                 )
             )
@@ -920,8 +1138,28 @@ def export_bgt60(
 def iter_phys_samples(loader: PhysDriveDataLoader) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     for session_id in loader.list_sessions():
-        for sample_id in loader.list_samples(session_id):
-            rows.append({"session_id": session_id, "sample_id": sample_id})
+        session_dir = loader.mmwave_path / session_id
+        candidates = []
+        for directory in session_dir.iterdir():
+            prefix = f"{session_id}_"
+            if directory.is_dir() and directory.name.startswith(prefix):
+                suffix = directory.name[len(prefix):]
+                if suffix.isdigit():
+                    candidates.append((int(suffix), directory.name))
+        id_counts: Dict[int, int] = {}
+        for sample_id, _ in candidates:
+            id_counts[sample_id] = id_counts.get(sample_id, 0) + 1
+        for sample_id, sample_dir_name in sorted(candidates):
+            sample_tag = (
+                sample_dir_name if id_counts[sample_id] > 1
+                else f"{session_id}_{sample_id:03d}"
+            )
+            rows.append({
+                "session_id": session_id,
+                "sample_id": sample_id,
+                "sample_dir_name": sample_dir_name,
+                "sample_tag": sample_tag,
+            })
     return rows
 
 
@@ -932,6 +1170,8 @@ def export_physdrive(
 ) -> Tuple[int, int]:
     started_at = time.monotonic()
     print_stage("PhysDrive", "Stage 1/4: initialize loader")
+    from .physdrive_loader import PhysDriveDataLoader
+
     loader = PhysDriveDataLoader(str(dataset_root / "PhysDrive"))
     dataset_out = output_dir / "PhysDrive"
     manifest_rows: List[Dict[str, Any]] = []
@@ -946,17 +1186,21 @@ def export_physdrive(
     for i, sample in enumerate(samples, start=1):
         session_id = sample["session_id"]
         sample_id = sample["sample_id"]
-        sample_tag = f"{session_id}_{sample_id:03d}"
+        sample_dir_name = sample["sample_dir_name"]
+        sample_tag = sample["sample_tag"]
 
         try:
             radar = loader.load_radar_data(
                 session_id=session_id,
                 sample_id=sample_id,
                 return_complex=True,
+                normalize_frames=False,
+                sample_dir_name=sample_dir_name,
             )
             ref = loader.load_reference_data(
                 session_id=session_id,
                 sample_id=sample_id,
+                sample_dir_name=sample_dir_name,
             )
             unified_ref = to_unified_reference(
                 "PhysDrive",
@@ -964,6 +1208,11 @@ def export_physdrive(
                 frame_rate_hz=PHYSDRIVE_FRAME_RATE_HZ,
             )
             radar_out = align_rda_shape(radar) if UNIFY_TO_RDA else radar
+            if radar_out.shape[0] != unified_ref["time"].size:
+                raise ValueError(
+                    f"PhysDrive 雷达与 ECG/RESP 帧数不一致: "
+                    f"radar={radar_out.shape[0]}, reference={unified_ref['time'].size}"
+                )
 
             npz_path = dataset_out / "samples" / f"{sample_tag}.npz"
             save_npz(
@@ -976,6 +1225,7 @@ def export_physdrive(
                 "dataset": "PhysDrive",
                 "session_id": session_id,
                 "sample_id": sample_id,
+                "source_sample_dir": sample_dir_name,
                 **build_common_radar_meta(
                     radar_out=radar_out,
                     radar_source=radar,
@@ -1049,6 +1299,14 @@ def export_physdrive(
 
 def main() -> None:
     args = parse_args()
+    ftu_frontend = FTUADCConfig()
+    if args.ftu_frontend_config is not None:
+        with args.ftu_frontend_config.open(encoding="utf-8") as handle:
+            ftu_frontend = FTUADCConfig.from_dict(json.load(handle))
+    bgt_frontend: FTUADCConfig = FTUADCConfig()
+    if args.bgt_frontend_config is not None:
+        with args.bgt_frontend_config.open(encoding="utf-8") as handle:
+            bgt_frontend = BGTADCConfig.from_dict(json.load(handle))
     # 优先使用CLI参数,否则使用默认配置
     dataset_root = (Path(args.dataset_root).resolve() if args.dataset_root 
                     else Path(DATASET_ROOT).resolve())
@@ -1068,6 +1326,18 @@ def main() -> None:
         selected_datasets.append("BGT60TR13C")
     if not selected_datasets:
         selected_datasets = export_order
+    if args.ftu_frontend_config is not None:
+        ftu_output = output_dir / "FTU"
+        if "FTU" in selected_datasets and ftu_output.exists() and any(ftu_output.iterdir()):
+            raise FileExistsError(
+                f"FTU frontend configuration requires a fresh output directory: {ftu_output}"
+            )
+    if args.bgt_frontend_config is not None and "BGT60TR13C" in selected_datasets:
+        bgt_output = output_dir / "BGT60TR13C"
+        if bgt_output.exists() and any(bgt_output.iterdir()):
+            raise FileExistsError(
+                f"BGT frontend export requires a fresh output directory: {bgt_output}"
+            )
 
     print_stage("Export", "Stage 0: configuration")
     print(f"[Export] dataset_root: {dataset_root}", flush=True)
@@ -1075,6 +1345,10 @@ def main() -> None:
     print(f"[Export] selected_datasets: {', '.join(selected_datasets)}", flush=True)
     print(f"[Export] compress_output: {COMPRESS_OUTPUT}", flush=True)
     print(f"[Export] unify_to_rda: {UNIFY_TO_RDA}", flush=True)
+    if "FTU" in selected_datasets:
+        print(f"[Export] ftu_frontend_fingerprint: {ftu_frontend.fingerprint}", flush=True)
+    if "BGT60TR13C" in selected_datasets:
+        print(f"[Export] bgt_frontend_fingerprint: {bgt_frontend.fingerprint}", flush=True)
 
     for dataset_name in selected_datasets:
         if dataset_name == "PhysDrive":
@@ -1091,13 +1365,16 @@ def main() -> None:
                 participant_id=FTU_PARTICIPANT_ID,
                 scenario=FTU_SCENARIO,
                 distance=FTU_DISTANCE,
+                frontend_config=ftu_frontend,
+                alias_audit=args.ftu_alias_audit,
             )
         elif dataset_name == "BGT60TR13C":
             ok, fail = export_bgt60(
                 dataset_root=dataset_root,
                 output_dir=output_dir,
                 compress=COMPRESS_OUTPUT,
-                include_long=BGT_INCLUDE_LONG,
+                include_long=BGT_INCLUDE_LONG and not args.bgt_skip_long,
+                frontend_config=bgt_frontend,
             )
         else:
             raise ValueError(f"Unsupported dataset: {dataset_name}")

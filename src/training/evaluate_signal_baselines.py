@@ -42,8 +42,7 @@ def parse_args() -> argparse.Namespace:
         "--dump-predictions",
         type=Path,
         default=None,
-        help="Export per-window predictions (columns required by "
-        "experiments/temporal/within_subject_reanalysis.py).",
+        help="Export per-window predictions with original record/window identities.",
     )
     parser.add_argument(
         "--fft-pad",
